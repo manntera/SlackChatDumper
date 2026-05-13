@@ -75,6 +75,9 @@ python export_slack.py --all-channels
 # 中断後の再実行（既に出力 JSON があるチャンネルは飛ばす）
 python export_slack.py --all-channels --skip-existing
 
+# 増分取得：既存ファイルがあれば「保存済みの最新メッセージ以降」だけ取得して既存ぶんとマージ
+python export_slack.py --all-channels --update
+
 # 並列ワーカー数を指定（チャンネル並列・スレッド返信並列の各プールの本数）
 python export_slack.py --all-channels --workers 6
 
@@ -88,6 +91,19 @@ python export_slack.py --all-channels --max-retries 0
 python export_slack.py --all-channels --no-threads
 python export_slack.py --all-channels --include-dms
 ```
+
+#### 増分取得（`--update`）
+
+`--update` を付けると、**既に出力 JSON があるチャンネルは「保存済みメッセージの中で最も新しい `ts` 以降」だけ**を `conversations.history` で取得し、既存ぶんとマージします（全期間モード時のみ有効）。出力 JSON が無いチャンネルは通常どおり全期間を取得します。単一チャンネルモード（`--all` / 日付 `all`）でも使えます。
+
+- 同じ `ts` のメッセージは新しく取得したほうで上書きするので、境界付近の編集も拾えます。
+- スレッド返信は**マージ後の全スレッド親について `conversations.replies` を取り直す**ので、既存スレッドへの新着返信も反映されます（＝大きな履歴ページネーションは省略しつつ、返信は最新化）。
+- 出力はこれまでどおりアトミックに書き出すので、増分中に殺しても壊れた JSON は残りません。
+
+> **限界**（これらが必要なときは `--update` なしでたまにフル再取得してください）
+> - 前回取得より**古いメッセージの編集・削除**は反映されません（その範囲は再取得しないため）。
+> - **古いメッセージに後からぶら下がった「新規スレッド」**（それまで返信 0 件だったメッセージへの初返信）は拾えません。
+> - `--update` と `--skip-existing` を同時に指定した場合は `--update` が優先されます（既存ファイルはスキップせず増分更新）。
 
 #### レート制限との付き合い方（重要）
 

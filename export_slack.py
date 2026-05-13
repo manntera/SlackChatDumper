@@ -8,6 +8,7 @@
     python export_slack.py --list                  # BOT が参照可能なチャンネル一覧
     python export_slack.py --all-channels          # 参照可能な全チャンネルを全期間エクスポート
     python export_slack.py --all-channels --skip-existing  # 取得済みは飛ばす（中断後の再開）
+    python export_slack.py --all-channels --update         # 既存ファイルがあれば新規ぶんだけ取得してマージ（増分取得）
     python export_slack.py --all-channels --include-dms    # DM / グループDM も含める
     python export_slack.py --all-channels --no-threads     # スレッド返信は取得しない
     python export_slack.py --all-channels --workers 6      # 並列ワーカー数（デフォルト 3）
@@ -26,6 +27,15 @@
         並列に取得する（往復レイテンシの隠蔽と history / replies の同時進行のため。--workers で調整）。
     つまり「並列数を上げる」ではなく「送出レートを適応制御」して、レート枠が許す範囲で最速に近づけます。
     途中で落ちても --skip-existing を付けて再実行すれば未取得ぶんだけ拾えます。
+
+増分取得（--update）について:
+    既に出力した JSON があるチャンネルは、保存済みメッセージの中で最も新しい ts 以降だけを
+    conversations.history で取得して既存ぶんとマージします（全期間モード時のみ有効）。スレッド返信は
+    マージ後の全スレッド親について再取得するので、既存スレッドへの新着返信も拾えます。
+    既存ファイルが無いチャンネルは通常どおり全期間を取得します。
+    ※ 仕様上の限界: 前回取得より古いメッセージの「編集・削除」、および古いメッセージに後から
+      ぶら下がった「新規スレッド」は反映されません。これらも正確に取りたい時は --update なしで
+      たまにフル再取得してください。
 """
 
 import argparse
@@ -236,6 +246,46 @@ def output_path(channel, period):
 
 
 # --------------------------------------------------------------------------- #
+# 増分取得（--update）まわり
+# --------------------------------------------------------------------------- #
+def load_existing_messages(path):
+    """既存の出力 JSON があれば messages 配列を返す。無い・壊れている場合は []。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, ValueError):
+        return []
+    msgs = data.get("messages")
+    return msgs if isinstance(msgs, list) else []
+
+
+def newest_message_ts(messages):
+    """トップレベルメッセージの中で最も新しい ts（文字列）。無ければ None。"""
+    best = None
+    for m in messages:
+        ts = m.get("ts")
+        if not ts:
+            continue
+        if best is None or float(ts) > float(best):
+            best = ts
+    return best
+
+
+def merge_messages(old_messages, new_messages):
+    """ts をキーに新旧をマージ（同 ts は新を採用）。Slack の history と同じ「新しい順」で返す。"""
+    by_ts = {}
+    for m in old_messages:
+        ts = m.get("ts")
+        if ts:
+            by_ts[ts] = m
+    for m in new_messages:
+        ts = m.get("ts")
+        if ts:
+            by_ts[ts] = m
+    return sorted(by_ts.values(), key=lambda m: float(m["ts"]), reverse=True)
+
+
+# --------------------------------------------------------------------------- #
 # Slack API 呼び出し（SlackResponse はイテレートすると自動でページネーションされる）
 # --------------------------------------------------------------------------- #
 def list_channels(client, types):
@@ -300,12 +350,14 @@ def join_public_channels(client):
     return [c for c in channels if c.get("is_member")]
 
 
-def fetch_history(client, channel_id, oldest=None, latest=None):
+def fetch_history(client, channel_id, oldest=None, latest=None, inclusive=False):
     kwargs = {"channel": channel_id, "limit": 200}
     if oldest is not None:
         kwargs["oldest"] = oldest
     if latest is not None:
         kwargs["latest"] = latest
+    if inclusive:
+        kwargs["inclusive"] = True
     messages = []
     for page in client.conversations_history(**kwargs):
         messages.extend(page["messages"])
@@ -354,15 +406,38 @@ def get_channel_info(client, channel_id):
 # エクスポート
 # --------------------------------------------------------------------------- #
 def export_channel(client, channel, oldest=None, latest=None, period="all",
-                   with_threads=True, reply_executor=None):
-    """1 チャンネル分を取得して JSON に書き出す。完了行（文字列）を返す。"""
+                   with_threads=True, reply_executor=None, incremental=False):
+    """1 チャンネル分を取得して JSON に書き出す。完了行（文字列）を返す。
+
+    incremental=True かつ period=="all" なら、既存 JSON があれば保存済みの最新 ts 以降だけを
+    取得して既存ぶんとマージする（スレッド返信はマージ後の全スレッド親を再取得して最新化）。
+    """
     channel_id = channel["id"]
     name = channel.get("name") or channel_id
+    path = output_path(channel, period)
 
-    messages = fetch_history(client, channel_id, oldest, latest)
+    existing = load_existing_messages(path) if (incremental and period == "all") else []
+    resume_ts = newest_message_ts(existing) if existing else None
+    if resume_ts is not None:
+        # resume_ts そのものも取り直して（境界メッセージの編集・新規返信を拾うため）ts で重複排除
+        oldest, latest, fetch_inclusive = resume_ts, None, True
+    else:
+        fetch_inclusive = False
+
+    new_messages = fetch_history(client, channel_id, oldest, latest, inclusive=fetch_inclusive)
+    new_count = len(new_messages)
+    messages = merge_messages(existing, new_messages) if existing else new_messages
+
     thread_count = reply_total = 0
     if with_threads:
         thread_count, reply_total = attach_threads(client, channel_id, messages, reply_executor)
+    else:
+        # 既存ファイルに replies が残っていれば件数だけ拾っておく
+        for m in messages:
+            r = m.get("replies")
+            if r:
+                thread_count += 1
+                reply_total += len(r)
 
     payload = {
         "channel": channel_id,
@@ -377,25 +452,30 @@ def export_channel(client, channel, oldest=None, latest=None, period="all",
     }
 
     os.makedirs(RESULT_DIR, exist_ok=True)
-    path = output_path(channel, period)
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)  # 中断時に壊れた JSON を残さない（--skip-existing の判定も安全に）
 
     detail = f" / スレッド {thread_count} 件・返信 {reply_total} 件" if with_threads else ""
+    if resume_ts is not None:
+        return f"🔄 #{name} ({channel_id}): 新規 {new_count} 件 → 合計 {len(messages)} 件{detail} → {path}"
     return f"✅ #{name} ({channel_id}): メッセージ {len(messages)} 件{detail} → {path}"
 
 
 def export_all_channels(client, channels, with_threads=True, workers=DEFAULT_WORKERS,
-                        skip_existing=False):
+                        skip_existing=False, incremental=False):
     """複数チャンネルを並列にエクスポートする。
 
     - チャンネル単位を workers 本のスレッドプールで並列実行
     - 各チャンネル内のスレッド返信取得も、全チャンネル共有の workers 本のプールで並列実行
       （プールを分けることでネスト時のデッドロックを避けつつ、同時 API 呼び出しを ~2*workers に抑える）
     - 実際の送出ペースは PacedWebClient のメソッド単位レートリミッタが律速する
+    - incremental=True なら既存 JSON があるチャンネルは新規ぶんだけ取得してマージする
     """
+    if skip_existing and incremental:
+        print("ℹ️  --update 指定時は --skip-existing は無視します（既存ファイルは増分更新します）")
+        skip_existing = False
     if skip_existing:
         pending = [c for c in channels if not os.path.exists(output_path(c, "all"))]
         n_skipped = len(channels) - len(pending)
@@ -408,7 +488,12 @@ def export_all_channels(client, channels, with_threads=True, workers=DEFAULT_WOR
 
     total = len(channels)
     note = "（スレッド返信込み）" if with_threads else "（スレッド返信なし）"
-    print(f"\n🚀 {total} 件のチャンネルを全期間エクスポートします{note} / 並列 {workers}")
+    if incremental:
+        n_update = sum(1 for c in channels if os.path.exists(output_path(c, "all")))
+        mode = f"増分取得（既存 {n_update} 件は新規ぶんのみ・残り {total - n_update} 件は全期間）"
+    else:
+        mode = "全期間エクスポート"
+    print(f"\n🚀 {total} 件のチャンネルを{mode}します{note} / 並列 {workers}")
     print("   送出レートは 429 を踏むと自動で半減・成功が続けば微増します（クライアント側ペーシング）")
 
     reply_executor = (ThreadPoolExecutor(max_workers=workers, thread_name_prefix="replies")
@@ -418,7 +503,8 @@ def export_all_channels(client, channels, with_threads=True, workers=DEFAULT_WOR
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="channel") as pool:
             futures = {
                 pool.submit(export_channel, client, c, period="all",
-                            with_threads=with_threads, reply_executor=reply_executor): c
+                            with_threads=with_threads, reply_executor=reply_executor,
+                            incremental=incremental): c
                 for c in channels
             }
             for fut in as_completed(futures):
@@ -489,6 +575,9 @@ def parse_args():
                    help="DM / グループDM も対象に含める（--join-public とは併用不可）")
     p.add_argument("--skip-existing", dest="skip_existing", action="store_true",
                    help="出力 JSON が既にあるチャンネルはスキップする（中断後の再実行に便利）")
+    p.add_argument("--update", "--incremental", dest="update", action="store_true",
+                   help=("増分取得。既存の出力 JSON があれば保存済みの最新メッセージ以降だけ取得して"
+                         "マージする（全期間モード時のみ有効。--skip-existing より優先）"))
     p.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                    help=f"並列ワーカー数（チャンネル並列・スレッド返信並列の各プールの本数 / デフォルト: {DEFAULT_WORKERS}）")
     p.add_argument("--start-rate", type=float, default=DEFAULT_START_RATE_PER_MIN, dest="start_rate",
@@ -519,7 +608,8 @@ def main():
 
             if args.all_channels:
                 export_all_channels(client, channels, with_threads=with_threads,
-                                    workers=workers, skip_existing=args.skip_existing)
+                                    workers=workers, skip_existing=args.skip_existing,
+                                    incremental=args.update)
             elif args.join_public:
                 print("\nℹ️  参加だけ完了しました。エクスポートも行うには --all-channels を付けて再実行してください。")
             return
@@ -538,8 +628,12 @@ def main():
             latest = dt.replace(hour=23, minute=59, second=59).timestamp()
             period = args.date
 
+        incremental = args.update and period == "all"
+        if args.update and not incremental:
+            print("ℹ️  --update は全期間モード（--all / 日付 all）のときだけ有効です。無視します。")
+
         channel = get_channel_info(client, args.channel_id)
-        if args.skip_existing and os.path.exists(output_path(channel, period)):
+        if args.skip_existing and not incremental and os.path.exists(output_path(channel, period)):
             print(f"⏭️  既に取得済みです: {output_path(channel, period)}")
             return
 
@@ -548,7 +642,7 @@ def main():
         try:
             log(export_channel(client, channel, oldest=oldest, latest=latest,
                                period=period, with_threads=with_threads,
-                               reply_executor=reply_executor))
+                               reply_executor=reply_executor, incremental=incremental))
         finally:
             if reply_executor is not None:
                 reply_executor.shutdown(wait=True)
