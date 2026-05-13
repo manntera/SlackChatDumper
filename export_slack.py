@@ -13,6 +13,8 @@
     python export_slack.py --all-channels --no-threads     # スレッド返信は取得しない
     python export_slack.py --all-channels --workers 6      # 並列ワーカー数（デフォルト 3）
     python export_slack.py --all-channels --start-rate 12  # 初期送出レート(req/分・メソッド毎)
+    python export_slack.py --all-channels --max-rate 120  # 送出レート上限(req/分・メソッド毎)を引き上げて速度を探る
+    python export_slack.py --all-channels --progress-interval 10  # 10 秒ごとに進捗・レート・429 を出力（0 で無効）
     python export_slack.py --join-public           # 全公開チャンネルに BOT を自動参加（要 channels:join）
     python export_slack.py --all-channels --join-public   # 全公開チャンネルに参加してエクスポート
 
@@ -20,13 +22,18 @@
     Slack のレート制限は「メソッド単位 × ワークスペース単位」で課されます。コネクション（並列数）
     を増やしても同一メソッドの合計スループットは増えません。そこで本ツールは:
       - メソッドごとに「クライアント側のトークンバケット」で送出レートを制御し、
-      - 429 を踏んだら送出レートを半減＋Retry-After ぶん全員待機、成功が続けば少しずつ増やす
-        （AIMD。実効レートが自動でレート枠付近に収束する）、
+      - 429 を踏んだら送出レートを 0.7 倍に下げ＋Retry-After ぶん全員待機、成功が続けば加算的に
+        少しずつ上げる（AIMD: multiplicative-decrease / additive-increase。実効レートが自動で
+        レート枠付近に収束する）、上限は Tier3（≒50 req/分）＋バースト余地ぶん、
       - 429 は Retry-After に従って（実質）無制限に再試行する（--max-retries で上限変更）、
       - --all-channels はチャンネルとスレッド返信(conversations.replies)を ThreadPoolExecutor で
         並列に取得する（往復レイテンシの隠蔽と history / replies の同時進行のため。--workers で調整）。
     つまり「並列数を上げる」ではなく「送出レートを適応制御」して、レート枠が許す範囲で最速に近づけます。
     途中で落ちても --skip-existing を付けて再実行すれば未取得ぶんだけ拾えます。
+    実行中は --progress-interval 秒ごとに「設定/実効レート・429 回数・取得中チャンネル」を、各チャンネル
+    完了時にそのチャンネルの所要時間と API 呼び出し回数を、終了時にメソッド別サマリ（リクエスト数・
+    429 率・スロットル待機時間・平均実効レート）と簡単なボトルネック診断を出力します。これを見ながら
+    --start-rate / --max-rate / --workers を詰めると、ダウンロード速度の上限が掴めます。
 
 増分取得（--update）について:
     既に出力した JSON があるチャンネルは、保存済みメッセージの中で最も新しい ts 以降だけを
@@ -56,9 +63,12 @@ load_dotenv()
 
 RESULT_DIR = "result"
 DEFAULT_WORKERS = 3
-DEFAULT_START_RATE_PER_MIN = 24.0   # メソッドあたりの初期送出レート（req/分）
+DEFAULT_START_RATE_PER_MIN = 30.0   # メソッドあたりの初期送出レート（req/分）
 MIN_RATE_PER_MIN = 1.0              # これ以上は下げない（実際の待機は Retry-After が担保）
-MAX_RATE_PER_MIN = 120.0            # これ以上は上げない
+# AIMD の上限。実測では conversations.replies は ~60/分でほぼ 429 を踏まないので、もう少し上を
+# 探らせる余地がある。--max-rate で実行時に変更可。上げすぎると 429→待機のロスが増えるので、
+# 終了時サマリの「429 率」を見ながら調整する。
+DEFAULT_MAX_RATE_PER_MIN = 90.0
 DEFAULT_MAX_RETRIES = 50            # 1 リクエストあたりの 429 リトライ上限（0 = 無制限）
 
 # 並列実行時に print の行が混ざらないようにするためのロック
@@ -70,15 +80,47 @@ def log(*args, **kwargs):
         print(*args, **kwargs)
 
 
+def _fmt_secs(s):
+    s = int(round(s))
+    if s < 60:
+        return f"{s}s"
+    return f"{s // 60}m{s % 60:02d}s"
+
+
+class _InFlight:
+    """いま処理中のチャンネル名の集合（スレッドセーフ。進捗ログ用）。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._names = set()
+
+    def add(self, name):
+        with self._lock:
+            self._names.add(name)
+
+    def discard(self, name):
+        with self._lock:
+            self._names.discard(name)
+
+    def snapshot(self):
+        with self._lock:
+            return sorted(self._names)
+
+
 # --------------------------------------------------------------------------- #
 # 適応レートリミッタ（メソッドごとに 1 個 / AIMD）
 # --------------------------------------------------------------------------- #
 class _MethodLimiter:
-    """1 メソッド分のトークンバケット。429 で送出レートを半減、成功が続けば少しずつ増やす。"""
+    """1 メソッド分のトークンバケット。AIMD で送出レートを適応制御する。
 
-    INCREASE_AFTER = 8       # この回数だけ連続成功したらレートを上げる
-    INCREASE_FACTOR = 1.1
-    DECREASE_FACTOR = 0.5
+    429 を踏んだら乗算的に下げ（multiplicative decrease）、成功が続いたら加算的に少しずつ
+    上げる（additive increase）。乗算増加だと「底から天井まで指数的に駆け上がって 429 で叩き
+    落とされる」のこぎり波で実効レートが伸びないので、加算増加で天井付近に滑らかに収束させる。
+    """
+
+    INCREASE_AFTER = 3                   # この回数だけ連続成功したらレートを 1 段上げる
+    INCREASE_STEP_PER_SEC = 2.0 / 60.0   # 1 段の増加幅（= +2 req/分）
+    DECREASE_FACTOR = 0.7                # 429 時の減速率（半減だと落としすぎ＆復帰が遅い）
 
     def __init__(self, rate_per_sec, min_rate, max_rate, capacity=2.0):
         self.rate = rate_per_sec
@@ -89,29 +131,49 @@ class _MethodLimiter:
         self.updated = time.monotonic()
         self.blocked_until = 0.0       # 429 を踏んだら Retry-After ぶんここまで全員待つ
         self.success_streak = 0
+        # --- 計測用カウンタ（ログ・サマリ用） ---
+        self.req_count = 0             # 送出したリクエスト数（429 含む全試行）
+        self.ok_count = 0              # 2xx で返ってきた数
+        self.rl_count = 0              # 429 を踏んだ数
+        self.throttle_events = 0       # スロットル（待機）に入った回数
+        self.throttle_wait_total = 0.0 # Retry-After 待機の累計秒（おおよそのロス時間）
+        self.pace_wait_total = 0.0     # トークン待ち（自前ペーシング）の累計スレッド秒
         self._cv = threading.Condition()
 
     def acquire(self):
         """1 リクエストぶんのトークンを取れるまで（必要なら）待つ。"""
         with self._cv:
-            while True:
-                now = time.monotonic()
-                if now < self.blocked_until:
-                    self._cv.wait(timeout=self.blocked_until - now)
-                    continue
-                self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
-                self.updated = now
-                if self.tokens >= 1.0:
-                    self.tokens -= 1.0
-                    return
-                self._cv.wait(timeout=max(0.01, (1.0 - self.tokens) / self.rate))
+            t0 = time.monotonic()
+            try:
+                while True:
+                    now = time.monotonic()
+                    if now < self.blocked_until:
+                        self._cv.wait(timeout=self.blocked_until - now)
+                        continue
+                    self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+                    self.updated = now
+                    if self.tokens >= 1.0:
+                        self.tokens -= 1.0
+                        return
+                    self._cv.wait(timeout=max(0.01, (1.0 - self.tokens) / self.rate))
+            finally:
+                self.pace_wait_total += time.monotonic() - t0
+
+    def note_response(self, status):
+        """HTTP 1 回ぶんの結果を記録する（レート制御とは別の純粋な計測）。"""
+        with self._cv:
+            self.req_count += 1
+            if isinstance(status, int) and 200 <= status < 300:
+                self.ok_count += 1
+            elif status == 429:
+                self.rl_count += 1
 
     def on_success(self):
         with self._cv:
             self.success_streak += 1
             if self.success_streak >= self.INCREASE_AFTER and self.rate < self.max_rate:
                 self.success_streak = 0
-                self.rate = min(self.max_rate, self.rate * self.INCREASE_FACTOR)
+                self.rate = min(self.max_rate, self.rate + self.INCREASE_STEP_PER_SEC)
 
     def on_rate_limited(self, retry_after):
         """429 を受けた。減速したら (old_rate, new_rate)、既に減速＆待機中なら None を返す。"""
@@ -127,6 +189,8 @@ class _MethodLimiter:
             self._cv.notify_all()
             if already_waiting:        # 同時多発の 429 で何重にも半減させない
                 return None
+            self.throttle_events += 1
+            self.throttle_wait_total += max(1.0, retry_after)
             old = self.rate
             self.rate = max(self.min_rate, self.rate * self.DECREASE_FACTOR)
             return old, self.rate
@@ -134,6 +198,20 @@ class _MethodLimiter:
     def rate_per_min(self):
         with self._cv:
             return self.rate * 60.0
+
+    def stats(self):
+        """現在のスナップショット（ログ・サマリ用）。"""
+        with self._cv:
+            return {
+                "rate_per_min": self.rate * 60.0,
+                "req": self.req_count,
+                "ok": self.ok_count,
+                "rl": self.rl_count,
+                "throttle_events": self.throttle_events,
+                "throttle_wait_total": self.throttle_wait_total,
+                "pace_wait_total": self.pace_wait_total,
+                "blocked_now": time.monotonic() < self.blocked_until,
+            }
 
 
 # --------------------------------------------------------------------------- #
@@ -185,24 +263,97 @@ class PacedWebClient(WebClient):
             lim.acquire()
             resp = super()._perform_urllib_http_request(url=url, args=args)
             status = resp.get("status")
+            lim.note_response(status)
             if status == 429:
                 wait = self._retry_after_seconds(resp.get("headers"))
                 changed = lim.on_rate_limited(wait)
                 if changed is not None:
                     old, new = changed
+                    st = lim.stats()
                     log(f"⏳ {method_name}: レート制限(429)。送出レートを "
-                        f"{old * 60:.0f}→{new * 60:.0f} req/分に下げ、~{wait:.0f}s 待機します")
+                        f"{old * 60:.0f}→{new * 60:.0f} req/分に下げ、~{wait:.0f}s 待機します "
+                        f"［この間 429 計 {st['rl']} 回 / リクエスト計 {st['req']} 回］")
                 if self._max_retries and attempt > self._max_retries:
                     log(f"❌ {method_name}: 429 が {self._max_retries} 回続いたため断念します")
                     return resp  # 上位で SlackApiError 化される
                 continue
             if isinstance(status, int) and 200 <= status < 300:
                 lim.on_success()
+            else:
+                # 429 以外のエラー応答もログに出す（速度より診断目的）
+                log(f"⚠️  {method_name}: HTTP {status} が返りました（リトライは slack_sdk 側に委譲）")
             return resp
 
     def limiter_summary(self):
         with self._limiters_lock:
             return {name: lim.rate_per_min() for name, lim in self._limiters.items()}
+
+    def method_stats(self):
+        """メソッド名 → stats() の dict（ログ・最終サマリ用）。"""
+        with self._limiters_lock:
+            items = list(self._limiters.items())
+        return {name: lim.stats() for name, lim in items}
+
+
+# --------------------------------------------------------------------------- #
+# 進捗レポータ（一定間隔でレート・実効スループット・429 状況を出力）
+# --------------------------------------------------------------------------- #
+class _StatusReporter(threading.Thread):
+    """interval 秒ごとに、メソッド別の「設定レート / 直近の実効レート / 429 回数」と
+    処理中チャンネル・全体進捗を 1 行で出す。ダウンロード速度のボトルネック観測用。
+    """
+
+    def __init__(self, client, interval, inflight, progress):
+        super().__init__(daemon=True, name="status")
+        self.client = client
+        self.interval = interval
+        self.inflight = inflight        # _InFlight
+        self.progress = progress        # callable -> (done, total)
+        # NOTE: 属性名 _stop は Thread の内部メソッドと衝突するので避ける
+        self._stop_evt = threading.Event()
+        self._started_at = time.monotonic()
+        self._last = {}                 # method -> (ok, rl, req) の前回値
+        self._last_at = self._started_at
+
+    def stop(self):
+        self._stop_evt.set()
+
+    def run(self):
+        while not self._stop_evt.wait(self.interval):
+            try:
+                self._report()
+            except Exception as e:  # noqa: BLE001 - 観測スレッドが落ちても本処理は止めない
+                log(f"⚠️  進捗レポータでエラー: {type(e).__name__}: {e}")
+
+    def _report(self):
+        now = time.monotonic()
+        dt = max(1e-6, now - self._last_at)
+        self._last_at = now
+        snap = self.client.method_stats()
+        if not snap:
+            return
+        parts = []
+        for m, s in sorted(snap.items()):
+            p_ok, p_rl, p_req = self._last.get(m, (0, 0, 0))
+            self._last[m] = (s["ok"], s["rl"], s["req"])
+            eff = (s["ok"] - p_ok) * 60.0 / dt          # 直近区間の成功 req/分
+            sent = (s["req"] - p_req) * 60.0 / dt       # 直近区間の送出 req/分（429 込み）
+            d_rl = s["rl"] - p_rl
+            seg = f"{m} 設定{s['rate_per_min']:.0f} 実効{eff:.0f}/分"
+            if sent - eff >= 1:
+                seg += f"(送出{sent:.0f})"
+            if d_rl:
+                seg += f" ⚠️429×{d_rl}"
+            if s["blocked_now"]:
+                seg += " ⏸待機中"
+            parts.append(seg)
+        done, total = self.progress()
+        inflight = self.inflight.snapshot()
+        inflight_str = ", ".join(f"#{n}" for n in inflight) if inflight else "-"
+        elapsed = _fmt_secs(now - self._started_at)
+        log(f"📊 [{elapsed}] 進捗 {done}/{total} ｜ "
+            + " ｜ ".join(parts)
+            + f" ｜ 取得中({len(inflight)}): {inflight_str}")
 
 
 # --------------------------------------------------------------------------- #
@@ -216,17 +367,18 @@ def load_config(path="config.json"):
         return {}
 
 
-def build_client(start_rate_per_min, max_retries):
+def build_client(start_rate_per_min, max_retries, max_rate_per_min=DEFAULT_MAX_RATE_PER_MIN):
     token = os.getenv("SLACK_TOKEN")
     if not token:
         print("❌ SLACK_TOKEN が設定されていません (.env を確認してください)")
         raise SystemExit(1)
-    start = min(MAX_RATE_PER_MIN, max(MIN_RATE_PER_MIN, start_rate_per_min)) / 60.0
+    max_rate = max(MIN_RATE_PER_MIN, float(max_rate_per_min))
+    start = min(max_rate, max(MIN_RATE_PER_MIN, start_rate_per_min)) / 60.0
     client = PacedWebClient(
         token=token,
         start_rate_per_sec=start,
         min_rate_per_sec=MIN_RATE_PER_MIN / 60.0,
-        max_rate_per_sec=MAX_RATE_PER_MIN / 60.0,
+        max_rate_per_sec=max_rate / 60.0,
         max_retries=max(0, int(max_retries)),
     )
     # ネットワーク系の一時エラーは slack_sdk 側でリトライ（429 は PacedWebClient が担当）
@@ -351,7 +503,8 @@ def join_public_channels(client):
 
 
 def fetch_history(client, channel_id, oldest=None, latest=None, inclusive=False):
-    kwargs = {"channel": channel_id, "limit": 200}
+    # limit は 1 ページあたりの取得件数（最大 999）。大きくするほどページ数＝API 呼び出し数が減る。
+    kwargs = {"channel": channel_id, "limit": 999}
     if oldest is not None:
         kwargs["oldest"] = oldest
     if latest is not None:
@@ -359,14 +512,16 @@ def fetch_history(client, channel_id, oldest=None, latest=None, inclusive=False)
     if inclusive:
         kwargs["inclusive"] = True
     messages = []
+    pages = 0
     for page in client.conversations_history(**kwargs):
+        pages += 1
         messages.extend(page["messages"])
-    return messages
+    return messages, pages  # pages = conversations.history の API 呼び出し回数
 
 
 def fetch_replies(client, channel_id, thread_ts):
     replies = []
-    for page in client.conversations_replies(channel=channel_id, ts=thread_ts, limit=200):
+    for page in client.conversations_replies(channel=channel_id, ts=thread_ts, limit=999):
         replies.extend(page["messages"])
     # conversations.replies は先頭に親メッセージを含むので除外する
     return replies[1:] if replies else []
@@ -406,14 +561,28 @@ def get_channel_info(client, channel_id):
 # エクスポート
 # --------------------------------------------------------------------------- #
 def export_channel(client, channel, oldest=None, latest=None, period="all",
-                   with_threads=True, reply_executor=None, incremental=False):
+                   with_threads=True, reply_executor=None, incremental=False, inflight=None):
     """1 チャンネル分を取得して JSON に書き出す。完了行（文字列）を返す。
 
     incremental=True かつ period=="all" なら、既存 JSON があれば保存済みの最新 ts 以降だけを
     取得して既存ぶんとマージする（スレッド返信はマージ後の全スレッド親を再取得して最新化）。
+    inflight が渡されていれば、処理中チャンネル集合に自分を登録/解除する（進捗ログ用）。
     """
     channel_id = channel["id"]
     name = channel.get("name") or channel_id
+    if inflight is not None:
+        inflight.add(name)
+    t_start = time.monotonic()
+    try:
+        return _export_channel_inner(client, channel, channel_id, name, oldest, latest, period,
+                                     with_threads, reply_executor, incremental, t_start)
+    finally:
+        if inflight is not None:
+            inflight.discard(name)
+
+
+def _export_channel_inner(client, channel, channel_id, name, oldest, latest, period,
+                          with_threads, reply_executor, incremental, t_start):
     path = output_path(channel, period)
 
     existing = load_existing_messages(path) if (incremental and period == "all") else []
@@ -424,13 +593,15 @@ def export_channel(client, channel, oldest=None, latest=None, period="all",
     else:
         fetch_inclusive = False
 
-    new_messages = fetch_history(client, channel_id, oldest, latest, inclusive=fetch_inclusive)
+    new_messages, hist_pages = fetch_history(client, channel_id, oldest, latest,
+                                             inclusive=fetch_inclusive)
     new_count = len(new_messages)
     messages = merge_messages(existing, new_messages) if existing else new_messages
 
-    thread_count = reply_total = 0
+    thread_count = reply_total = replies_calls = 0
     if with_threads:
         thread_count, reply_total = attach_threads(client, channel_id, messages, reply_executor)
+        replies_calls = thread_count  # conversations.replies の呼び出し回数（大きいスレッドは ≥1）
     else:
         # 既存ファイルに replies が残っていれば件数だけ拾っておく
         for m in messages:
@@ -457,14 +628,20 @@ def export_channel(client, channel, oldest=None, latest=None, period="all",
         json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)  # 中断時に壊れた JSON を残さない（--skip-existing の判定も安全に）
 
+    elapsed = time.monotonic() - t_start
+    api_calls = hist_pages + replies_calls
+    msg_per_s = len(messages) / elapsed if elapsed > 0 else 0.0
     detail = f" / スレッド {thread_count} 件・返信 {reply_total} 件" if with_threads else ""
+    api = (f" ｜ {_fmt_secs(elapsed)} / API {api_calls} 回(history {hist_pages}＋replies {replies_calls})"
+           f" / {msg_per_s:.0f} msg/s")
     if resume_ts is not None:
-        return f"🔄 #{name} ({channel_id}): 新規 {new_count} 件 → 合計 {len(messages)} 件{detail} → {path}"
-    return f"✅ #{name} ({channel_id}): メッセージ {len(messages)} 件{detail} → {path}"
+        return (f"🔄 #{name} ({channel_id}): 新規 {new_count} 件 → 合計 {len(messages)} 件"
+                f"{detail}{api} → {path}")
+    return f"✅ #{name} ({channel_id}): メッセージ {len(messages)} 件{detail}{api} → {path}"
 
 
 def export_all_channels(client, channels, with_threads=True, workers=DEFAULT_WORKERS,
-                        skip_existing=False, incremental=False):
+                        skip_existing=False, incremental=False, progress_interval=30.0):
     """複数チャンネルを並列にエクスポートする。
 
     - チャンネル単位を workers 本のスレッドプールで並列実行
@@ -472,6 +649,7 @@ def export_all_channels(client, channels, with_threads=True, workers=DEFAULT_WOR
       （プールを分けることでネスト時のデッドロックを避けつつ、同時 API 呼び出しを ~2*workers に抑える）
     - 実際の送出ペースは PacedWebClient のメソッド単位レートリミッタが律速する
     - incremental=True なら既存 JSON があるチャンネルは新規ぶんだけ取得してマージする
+    - progress_interval 秒ごとに送出レート・実効スループット・429 状況を出力（0 で無効）
     """
     if skip_existing and incremental:
         print("ℹ️  --update 指定時は --skip-existing は無視します（既存ファイルは増分更新します）")
@@ -494,38 +672,76 @@ def export_all_channels(client, channels, with_threads=True, workers=DEFAULT_WOR
     else:
         mode = "全期間エクスポート"
     print(f"\n🚀 {total} 件のチャンネルを{mode}します{note} / 並列 {workers}")
-    print("   送出レートは 429 を踏むと自動で半減・成功が続けば微増します（クライアント側ペーシング）")
+    print(f"   送出レート: 初期 {client._start_rate * 60:.0f}/分・上限 {client._max_rate * 60:.0f}/分"
+          f"（メソッド毎）。429 で 0.7 倍に減速＋Retry-After ぶん待機、成功が続けば +{_MethodLimiter.INCREASE_STEP_PER_SEC * 60:.0f}/分ずつ復帰（AIMD）")
+    if progress_interval > 0:
+        print(f"   {progress_interval:.0f} 秒ごとに 📊 進捗行（設定/実効レート・429・取得中チャンネル）を出します")
 
+    inflight = _InFlight()
+    state = {"done": 0}
+    reporter = None
+    if progress_interval > 0:
+        reporter = _StatusReporter(client, progress_interval, inflight,
+                                   lambda: (state["done"], total))
+        reporter.start()
+
+    t_wall0 = time.monotonic()
     reply_executor = (ThreadPoolExecutor(max_workers=workers, thread_name_prefix="replies")
                       if with_threads else None)
-    done = 0
+    ok = err = 0
     try:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="channel") as pool:
             futures = {
                 pool.submit(export_channel, client, c, period="all",
                             with_threads=with_threads, reply_executor=reply_executor,
-                            incremental=incremental): c
+                            incremental=incremental, inflight=inflight): c
                 for c in channels
             }
             for fut in as_completed(futures):
                 c = futures[fut]
-                done += 1
+                state["done"] += 1
+                done = state["done"]
                 cname = c.get("name", c["id"])
                 try:
                     summary = fut.result()
                 except SlackApiError as e:
+                    err += 1
                     log(f"⚠️  [{done}/{total}] #{cname} をスキップ: {e.response.get('error')}")
                 except Exception as e:  # noqa: BLE001 - 1 チャンネルの失敗で全体を止めない
+                    err += 1
                     log(f"⚠️  [{done}/{total}] #{cname} で予期しないエラー: {type(e).__name__}: {e}")
                 else:
+                    ok += 1
                     log(f"[{done}/{total}] {summary}")
     finally:
         if reply_executor is not None:
             reply_executor.shutdown(wait=True)
+        if reporter is not None:
+            reporter.stop()
+            reporter.join(timeout=2.0)
 
-    rates = client.limiter_summary()
-    if rates:
-        print("📈 最終的な送出レート: " + ", ".join(f"{m} {r:.0f}/分" for m, r in sorted(rates.items())))
+    wall = time.monotonic() - t_wall0
+    print(f"\n📊 メソッド別の最終サマリ（{_fmt_secs(wall)} 経過 / 成功 {ok} 件・失敗 {err} 件）:")
+    stats = client.method_stats()
+    for m, s in sorted(stats.items()):
+        avg = s["ok"] / wall * 60.0 if wall > 0 else 0.0
+        ratio = (s["rl"] / s["req"] * 100.0) if s["req"] else 0.0
+        print(f"   {m}: リクエスト {s['req']} 回（成功 {s['ok']} / 429 {s['rl']} = {ratio:.1f}%）"
+              f" / 平均実効 {avg:.0f}/分・最終 {s['rate_per_min']:.0f}/分"
+              f" / スロットル {s['throttle_events']} 回・待機計 {_fmt_secs(s['throttle_wait_total'])}"
+              f" / ペーシング待ち計 {_fmt_secs(s['pace_wait_total'])}")
+    if stats:
+        # ボトルネック診断のヒント
+        worst = max(stats.items(), key=lambda kv: kv[1]["req"])
+        ws = worst[1]
+        hint = []
+        if ws["rl"] / max(1, ws["req"]) > 0.15:
+            hint.append(f"{worst[0]} の 429 率が高め → --max-rate / --start-rate を下げると待機ロスが減るかも")
+        if ws["throttle_wait_total"] > wall * 0.2:
+            hint.append("スロットル待機が総時間の 2 割超 → レート枠が真のボトルネック。別 App/別トークンでの並走が有効")
+        if not hint:
+            hint.append("429 率は低め＆送出レートが --max-rate に張り付いているなら --max-rate を上げると更に速くなる可能性")
+        print("   💡 " + " / ".join(hint))
     print("🎉 完了しました（スキップが出た場合は --skip-existing を付けて再実行できます）")
 
 
@@ -581,17 +797,23 @@ def parse_args():
     p.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                    help=f"並列ワーカー数（チャンネル並列・スレッド返信並列の各プールの本数 / デフォルト: {DEFAULT_WORKERS}）")
     p.add_argument("--start-rate", type=float, default=DEFAULT_START_RATE_PER_MIN, dest="start_rate",
-                   help=("メソッドごとの初期送出レート（req/分）。429 を踏むと自動で半減し、成功が"
-                         f"続けば最大 {MAX_RATE_PER_MIN:.0f}/分まで増える（デフォルト: {DEFAULT_START_RATE_PER_MIN:.0f}）"))
+                   help=("メソッドごとの初期送出レート（req/分）。429 を踏むと自動で 0.7 倍に減速し、"
+                         f"成功が続けば --max-rate まで増える（デフォルト: {DEFAULT_START_RATE_PER_MIN:.0f}）"))
+    p.add_argument("--max-rate", type=float, default=DEFAULT_MAX_RATE_PER_MIN, dest="max_rate",
+                   help=("AIMD の送出レート上限（req/分・メソッド毎）。実測の 429 率を見ながら上げ下げする。"
+                         f"上げすぎると 429→待機のロスが増える（デフォルト: {DEFAULT_MAX_RATE_PER_MIN:.0f}）"))
     p.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES, dest="max_retries",
                    help=("1 リクエストあたりの 429 リトライ上限（0 = 無制限）。各回 Retry-After ぶん"
                          f"待機する（デフォルト: {DEFAULT_MAX_RETRIES}）"))
+    p.add_argument("--progress-interval", type=float, default=30.0, dest="progress_interval",
+                   help=("--all-channels で N 秒ごとに進捗・レート・429 状況を出力する（0 で無効 / "
+                         "デフォルト: 30）"))
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    client = build_client(args.start_rate, args.max_retries)
+    client = build_client(args.start_rate, args.max_retries, max_rate_per_min=args.max_rate)
     with_threads = not args.no_threads
     workers = max(1, args.workers)
     types = "public_channel,private_channel" + (",im,mpim" if args.include_dms else "")
@@ -609,7 +831,8 @@ def main():
             if args.all_channels:
                 export_all_channels(client, channels, with_threads=with_threads,
                                     workers=workers, skip_existing=args.skip_existing,
-                                    incremental=args.update)
+                                    incremental=args.update,
+                                    progress_interval=max(0.0, args.progress_interval))
             elif args.join_public:
                 print("\nℹ️  参加だけ完了しました。エクスポートも行うには --all-channels を付けて再実行してください。")
             return
