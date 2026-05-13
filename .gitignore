@@ -2,3 +2,4 @@
 .env
 config.json
 result/
+__pycache__/
