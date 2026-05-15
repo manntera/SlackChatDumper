@@ -23,6 +23,7 @@ pip install -r requirements.txt
 | 公開チャンネルへ BOT を自動参加（`--join-public`） | `channels:join` |
 | 非公開チャンネルの一覧・履歴 | `groups:read`, `groups:history` |
 | DM / グループDM（`--include-dms`） | `im:read`, `im:history`, `mpim:read`, `mpim:history` |
+| ユーザー一覧（`--list-users`） | `users:read`（メール込みなら `users:read.email` も） |
 
 > **メッセージ履歴の取得には BOT がそのチャンネルのメンバーである必要があります**（Slack の仕様）。
 > - 既定の `--list` / `--all-channels` は **BOT が既にメンバーのチャンネル**（`users.conversations`）が対象です。
@@ -62,6 +63,15 @@ python export_slack.py --list
 # DM / グループDM も含める
 python export_slack.py --list --include-dms
 ```
+
+### ユーザー一覧
+
+```bash
+# ワークスペースの全ユーザーを result/users.json に保存（削除済み・BOT も含む）
+python export_slack.py --list-users
+```
+
+メッセージ JSON の `user` フィールド（`U0123ABC456` 形式の ID）は置換しません。代わりに `users.json` を引いて誰の発言かを特定する想定です。`users:read.email` スコープがあれば `profile.email` も保存されます。
 
 ### 全チャンネルを一括エクスポート
 

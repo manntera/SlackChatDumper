@@ -6,6 +6,7 @@
     python export_slack.py <channel_id> all        # 全期間
     python export_slack.py --all                   # config のチャンネルを全期間
     python export_slack.py --list                  # BOT が参照可能なチャンネル一覧
+    python export_slack.py --list-users            # ワークスペースの全ユーザー一覧 (要 users:read[, users:read.email])
     python export_slack.py --all-channels          # 参照可能な全チャンネルを全期間エクスポート
     python export_slack.py --all-channels --skip-existing  # 取得済みは飛ばす（中断後の再開）
     python export_slack.py --all-channels --update         # 既存ファイルがあれば新規ぶんだけ取得してマージ（増分取得）
@@ -502,6 +503,20 @@ def join_public_channels(client):
     return [c for c in channels if c.get("is_member")]
 
 
+def list_users(client):
+    """ワークスペースの全ユーザーを users.list で取得する（削除済み・BOT も含む）。
+
+    members は cursor pagination されるので SlackResponse をイテレートして連結する。
+    削除済みユーザーは過去メッセージの user ID 解決のために残しておく。
+    """
+    users = []
+    for page in client.users_list(limit=200):
+        users.extend(page["members"])
+    # 有効ユーザーが先、その中は名前順。削除済みは末尾にまとめる。
+    users.sort(key=lambda u: (bool(u.get("deleted")), (u.get("name") or u.get("id", "")).lower()))
+    return users
+
+
 def fetch_history(client, channel_id, oldest=None, latest=None, inclusive=False):
     # limit は 1 ページあたりの取得件数（最大 999）。大きくするほどページ数＝API 呼び出し数が減る。
     kwargs = {"channel": channel_id, "limit": 999}
@@ -765,6 +780,39 @@ def dump_channel_list(channels):
     return path
 
 
+def dump_user_list(users):
+    """users.list の結果を result/users.json に保存し、サマリを表示する。
+
+    メッセージ JSON の `user` フィールド（U0123ABC456 形式）をこの users.json で引けば
+    誰の発言か特定できる。出力は users.list の生のメンバー配列をそのまま保持する。
+    """
+    os.makedirs(RESULT_DIR, exist_ok=True)
+    path = os.path.join(RESULT_DIR, "users.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(users, f, ensure_ascii=False, indent=2)
+
+    active = [u for u in users if not u.get("deleted")]
+    bots = [u for u in active if u.get("is_bot")]
+    print(f"📋 ユーザー {len(users)} 件"
+          f"（有効 {len(active)} / うち BOT {len(bots)} / 削除済み {len(users) - len(active)}）:")
+    for u in users:
+        if u.get("deleted"):
+            mark = "❌"
+        elif u.get("is_bot"):
+            mark = "🤖"
+        else:
+            mark = "👤"
+        profile = u.get("profile") or {}
+        real = u.get("real_name") or profile.get("real_name") or ""
+        display = profile.get("display_name") or ""
+        email = profile.get("email") or ""
+        label_parts = [s for s in (real, f"@{display}" if display else "", email) if s]
+        label = " / ".join(label_parts) if label_parts else (u.get("name") or "")
+        print(f"  {mark} {u['id']:<12} {label}")
+    print(f"→ 一覧を {path} に保存しました（メッセージ JSON の `user` フィールドはここから引けます）")
+    return path
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -781,6 +829,8 @@ def parse_args():
     p.add_argument("--all", action="store_true", help="全期間のメッセージを取得する")
     p.add_argument("--list", dest="list_only", action="store_true",
                    help="BOT が参照可能なチャンネル一覧を表示し result/channels.json に保存する")
+    p.add_argument("--list-users", dest="list_users", action="store_true",
+                   help="ワークスペースの全ユーザー一覧を result/users.json に保存する（要 users:read）")
     p.add_argument("--all-channels", dest="all_channels", action="store_true",
                    help="参照可能な全チャンネルを全期間エクスポートする")
     p.add_argument("--join-public", dest="join_public", action="store_true",
@@ -819,6 +869,11 @@ def main():
     types = "public_channel,private_channel" + (",im,mpim" if args.include_dms else "")
 
     try:
+        if args.list_users:
+            users = list_users(client)
+            dump_user_list(users)
+            return
+
         if args.list_only or args.all_channels or args.join_public:
             if args.join_public:
                 if args.include_dms:
