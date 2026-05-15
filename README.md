@@ -179,3 +179,64 @@ python export_slack.py <チャンネルID> all
   ]
 }
 ```
+
+## SQLite に取り込んで集計する
+
+`result/` 配下の JSON を SQLite に流し込み、SQL で横断検索・集計できるようにします。
+**既存の JSON は書き換えません**。後段の取り込みスクリプト（`import_to_sqlite.py`）として独立しています。
+
+```bash
+# result/ 配下の slack_*.json / channels.json / users.json を全部取り込み、result/slack.db を作る
+python import_to_sqlite.py
+
+# 既存テーブルを DROP して作り直し（スキーマを変えたとき）
+python import_to_sqlite.py --reset
+
+# 特定のファイルだけ取り込み（--update で更新したぶんを反映、など）
+python import_to_sqlite.py result/slack_C0123456789_general_all.json
+
+# 出力先 DB を変える
+python import_to_sqlite.py --db /tmp/slack.db
+```
+
+再実行は UPSERT で安全です（`messages` は `(channel_id, ts)` を主キーに更新、`reactions`/`files` は対象メッセージぶんを入れ替え）。
+
+### スキーマ
+
+| テーブル | 主キー | 主な列 |
+| --- | --- | --- |
+| `channels` | `id` | `name`, `is_private`, `is_im`, `is_mpim`, `period`, `exported_at`, `message_count`, `thread_count`, `reply_count`, `raw` |
+| `users` | `id` | `name`, `real_name`, `display_name`, `email`, `is_bot`, `deleted`, `raw` |
+| `messages` | `(channel_id, ts)` | `thread_ts`, `parent_ts`, `is_reply`, `user`, `type`, `subtype`, `text`, `reply_count`, `edited_ts`, `client_msg_id`, `raw` |
+| `reactions` | `(channel_id, ts, name, user)` | （絵文字名と押したユーザーを 1 行ずつ展開） |
+| `files` | `(channel_id, ts, file_id)` | `name`, `title`, `mimetype`, `filetype`, `size`, `user`, `url_private`, `permalink`, `raw` |
+
+- スレッド返信は `messages` に同居し、`is_reply = 1` ・ `parent_ts = 親メッセージの ts` で区別します。スレッド単位の取り出しは `WHERE channel_id = ? AND (ts = :root OR parent_ts = :root)`。
+- `raw` 列には元 JSON をそのまま保存しているので、スキーマに無い項目も `json_extract(raw, '$.path')` で取り出せます。
+
+### クエリ例
+
+```sql
+-- ユーザー別の発言数 TOP10（BOT 除外）
+SELECT u.real_name, u.name, COUNT(*) AS n
+FROM messages m
+JOIN users u ON u.id = m.user
+WHERE u.is_bot = 0 AND u.deleted = 0
+GROUP BY m.user
+ORDER BY n DESC
+LIMIT 10;
+
+-- あるチャンネルのスレッドを 1 本ぶん時系列で取り出す
+SELECT ts, user, text
+FROM messages
+WHERE channel_id = 'C0123456789'
+  AND (ts = '1700000000.000100' OR parent_ts = '1700000000.000100')
+ORDER BY ts;
+
+-- 絵文字リアクションの利用ランキング
+SELECT name, COUNT(*) AS n
+FROM reactions
+GROUP BY name
+ORDER BY n DESC
+LIMIT 20;
+```

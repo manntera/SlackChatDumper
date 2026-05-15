@@ -1,0 +1,11 @@
+{
+    "sqltools.connections": [
+        {
+            "previewLimit": 50,
+            "driver": "SQLite",
+            "name": "slack_log",
+            "database": "${workspaceFolder:SlackChatDumper}/result/slack.db"
+        }
+    ],
+    "sqltools.useNodeRuntime": true
+}
