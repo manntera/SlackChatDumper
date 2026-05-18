@@ -21,6 +21,9 @@ esac
 mkdir -p logs
 log_file="logs/update-$(date +%Y%m%d-%H%M%S).log"
 
+# tee 経由だと Python の stdout がブロックバッファ化して進捗が出なくなるので unbuffered に
+export PYTHONUNBUFFERED=1
+
 # 以降の標準出力/標準エラーを画面とログの両方へ
 exec > >(tee -a "$log_file") 2>&1
 
