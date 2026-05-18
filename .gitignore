@@ -3,3 +3,4 @@
 config.json
 result/
 __pycache__/
+logs/

@@ -180,6 +180,26 @@ python export_slack.py <チャンネルID> all
 }
 ```
 
+## 運用取得をワンコマンドで（`update.sh`）
+
+`users.json` 更新 → 全チャンネル増分取得 → SQLite 反映、をまとめて実行します。ログは `logs/update-YYYYMMDD-HHMMSS.log` に保存されます。
+
+```bash
+# 通常運用（増分取得 = --update）
+./update.sh
+
+# 初回 or 定期フル取得（全期間を取り直す）
+./update.sh fresh
+```
+
+中で実行しているのは以下と同等です。
+
+```bash
+python export_slack.py --list-users
+python export_slack.py --all-channels --update     # fresh のときは --update なし
+python import_to_sqlite.py
+```
+
 ## SQLite に取り込んで集計する
 
 `result/` 配下の JSON を SQLite に流し込み、SQL で横断検索・集計できるようにします。
