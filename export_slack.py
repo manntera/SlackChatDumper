@@ -12,29 +12,28 @@
     python export_slack.py --all-channels --update         # 既存ファイルがあれば新規ぶんだけ取得してマージ（増分取得）
     python export_slack.py --all-channels --include-dms    # DM / グループDM も含める
     python export_slack.py --all-channels --no-threads     # スレッド返信は取得しない
-    python export_slack.py --all-channels --workers 6      # 並列ワーカー数（デフォルト 3）
     python export_slack.py --all-channels --start-rate 12  # 初期送出レート(req/分・メソッド毎)
     python export_slack.py --all-channels --max-rate 120  # 送出レート上限(req/分・メソッド毎)を引き上げて速度を探る
     python export_slack.py --all-channels --progress-interval 10  # 10 秒ごとに進捗・レート・429 を出力（0 で無効）
     python export_slack.py --join-public           # 全公開チャンネルに BOT を自動参加（要 channels:join）
     python export_slack.py --all-channels --join-public   # 全公開チャンネルに参加してエクスポート
 
-レート制限と並列取得について:
+レート制限と取得方針について:
     Slack のレート制限は「メソッド単位 × ワークスペース単位」で課されます。コネクション（並列数）
     を増やしても同一メソッドの合計スループットは増えません。そこで本ツールは:
       - メソッドごとに「クライアント側のトークンバケット」で送出レートを制御し、
-      - 429 を踏んだら送出レートを 0.7 倍に下げ＋Retry-After ぶん全員待機、成功が続けば加算的に
+      - 429 を踏んだら送出レートを 0.7 倍に下げ＋Retry-After ぶん待機、成功が続けば加算的に
         少しずつ上げる（AIMD: multiplicative-decrease / additive-increase。実効レートが自動で
-        レート枠付近に収束する）、上限は Tier3（≒50 req/分）＋バースト余地ぶん、
+        レート枠付近に収束する）、
       - 429 は Retry-After に従って（実質）無制限に再試行する（--max-retries で上限変更）、
-      - --all-channels はチャンネルとスレッド返信(conversations.replies)を ThreadPoolExecutor で
-        並列に取得する（往復レイテンシの隠蔽と history / replies の同時進行のため。--workers で調整）。
-    つまり「並列数を上げる」ではなく「送出レートを適応制御」して、レート枠が許す範囲で最速に近づけます。
+      - --all-channels はチャンネルを 1 件ずつ直列に処理する（並列にしてもレート枠が律速で
+        速くならず、429 とメモリピークだけが増えるため）。スレッド返信(conversations.replies)も
+        各チャンネル内で直列に取得する。
     途中で落ちても --skip-existing を付けて再実行すれば未取得ぶんだけ拾えます。
     実行中は --progress-interval 秒ごとに「設定/実効レート・429 回数・取得中チャンネル」を、各チャンネル
     完了時にそのチャンネルの所要時間と API 呼び出し回数を、終了時にメソッド別サマリ（リクエスト数・
     429 率・スロットル待機時間・平均実効レート）と簡単なボトルネック診断を出力します。これを見ながら
-    --start-rate / --max-rate / --workers を詰めると、ダウンロード速度の上限が掴めます。
+    --start-rate / --max-rate を詰めると、ダウンロード速度の上限が掴めます。
 
 増分取得（--update）について:
     既に出力した JSON があるチャンネルは、保存済みメッセージの中で最も新しい ts 以降だけを
@@ -52,7 +51,6 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -63,16 +61,14 @@ from slack_sdk.http_retry.builtin_handlers import ConnectionErrorRetryHandler
 load_dotenv()
 
 RESULT_DIR = "result"
-DEFAULT_WORKERS = 3
 DEFAULT_START_RATE_PER_MIN = 30.0   # メソッドあたりの初期送出レート（req/分）
 MIN_RATE_PER_MIN = 1.0              # これ以上は下げない（実際の待機は Retry-After が担保）
-# AIMD の上限。実測では conversations.replies は ~60/分でほぼ 429 を踏まないので、もう少し上を
-# 探らせる余地がある。--max-rate で実行時に変更可。上げすぎると 429→待機のロスが増えるので、
-# 終了時サマリの「429 率」を見ながら調整する。
-DEFAULT_MAX_RATE_PER_MIN = 90.0
+# AIMD の上限。実測ログでは conversations.replies は 60 を超えると 429 を頻発する。上げすぎると
+# 429→Retry-After 待機のロスが増えてむしろ遅くなるので、控えめに 60。--max-rate で実行時に変更可。
+DEFAULT_MAX_RATE_PER_MIN = 60.0
 DEFAULT_MAX_RETRIES = 50            # 1 リクエストあたりの 429 リトライ上限（0 = 無制限）
 
-# 並列実行時に print の行が混ざらないようにするためのロック
+# StatusReporter（別スレッド）と main の print が混ざらないようにするためのロック
 _print_lock = threading.Lock()
 
 
@@ -86,26 +82,6 @@ def _fmt_secs(s):
     if s < 60:
         return f"{s}s"
     return f"{s // 60}m{s % 60:02d}s"
-
-
-class _InFlight:
-    """いま処理中のチャンネル名の集合（スレッドセーフ。進捗ログ用）。"""
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._names = set()
-
-    def add(self, name):
-        with self._lock:
-            self._names.add(name)
-
-    def discard(self, name):
-        with self._lock:
-            self._names.discard(name)
-
-    def snapshot(self):
-        with self._lock:
-            return sorted(self._names)
 
 
 # --------------------------------------------------------------------------- #
@@ -302,13 +278,16 @@ class PacedWebClient(WebClient):
 class _StatusReporter(threading.Thread):
     """interval 秒ごとに、メソッド別の「設定レート / 直近の実効レート / 429 回数」と
     処理中チャンネル・全体進捗を 1 行で出す。ダウンロード速度のボトルネック観測用。
+
+    直列実行なので「処理中のチャンネル」は常に 0 or 1 件。current() は現在処理中の
+    チャンネル名（無ければ None）を返す callable。
     """
 
-    def __init__(self, client, interval, inflight, progress):
+    def __init__(self, client, interval, current, progress):
         super().__init__(daemon=True, name="status")
         self.client = client
         self.interval = interval
-        self.inflight = inflight        # _InFlight
+        self.current = current          # callable -> str | None
         self.progress = progress        # callable -> (done, total)
         # NOTE: 属性名 _stop は Thread の内部メソッドと衝突するので避ける
         self._stop_evt = threading.Event()
@@ -349,12 +328,12 @@ class _StatusReporter(threading.Thread):
                 seg += " ⏸待機中"
             parts.append(seg)
         done, total = self.progress()
-        inflight = self.inflight.snapshot()
-        inflight_str = ", ".join(f"#{n}" for n in inflight) if inflight else "-"
+        current = self.current()
+        current_str = f"#{current}" if current else "-"
         elapsed = _fmt_secs(now - self._started_at)
         log(f"📊 [{elapsed}] 進捗 {done}/{total} ｜ "
             + " ｜ ".join(parts)
-            + f" ｜ 取得中({len(inflight)}): {inflight_str}")
+            + f" ｜ 取得中: {current_str}")
 
 
 # --------------------------------------------------------------------------- #
@@ -542,24 +521,19 @@ def fetch_replies(client, channel_id, thread_ts):
     return replies[1:] if replies else []
 
 
-def attach_threads(client, channel_id, messages, reply_executor=None):
-    """history で得たメッセージのうちスレッド親に、replies を付与する。
+def attach_threads(client, channel_id, messages):
+    """history で得たメッセージのうちスレッド親に、replies を付与する（直列取得）。
 
-    reply_executor が渡されればスレッドごとの conversations.replies を並列に取得する。
+    並列にしてもレート枠が律速するので速くはならず、429 と一時メモリだけが増える。
     """
     parents = [m for m in messages
                if m.get("ts") and m.get("thread_ts") == m["ts"] and m.get("reply_count", 0) > 0]
     if not parents:
         return 0, 0
 
-    if reply_executor is None:
-        replies_list = [fetch_replies(client, channel_id, m["ts"]) for m in parents]
-    else:
-        replies_list = list(reply_executor.map(
-            lambda m: fetch_replies(client, channel_id, m["ts"]), parents))
-
     reply_total = 0
-    for msg, replies in zip(parents, replies_list):
+    for msg in parents:
+        replies = fetch_replies(client, channel_id, msg["ts"])
         msg["replies"] = replies
         reply_total += len(replies)
     return len(parents), reply_total
@@ -576,28 +550,21 @@ def get_channel_info(client, channel_id):
 # エクスポート
 # --------------------------------------------------------------------------- #
 def export_channel(client, channel, oldest=None, latest=None, period="all",
-                   with_threads=True, reply_executor=None, incremental=False, inflight=None):
+                   with_threads=True, incremental=False):
     """1 チャンネル分を取得して JSON に書き出す。完了行（文字列）を返す。
 
     incremental=True かつ period=="all" なら、既存 JSON があれば保存済みの最新 ts 以降だけを
     取得して既存ぶんとマージする（スレッド返信はマージ後の全スレッド親を再取得して最新化）。
-    inflight が渡されていれば、処理中チャンネル集合に自分を登録/解除する（進捗ログ用）。
     """
     channel_id = channel["id"]
     name = channel.get("name") or channel_id
-    if inflight is not None:
-        inflight.add(name)
     t_start = time.monotonic()
-    try:
-        return _export_channel_inner(client, channel, channel_id, name, oldest, latest, period,
-                                     with_threads, reply_executor, incremental, t_start)
-    finally:
-        if inflight is not None:
-            inflight.discard(name)
+    return _export_channel_inner(client, channel, channel_id, name, oldest, latest, period,
+                                 with_threads, incremental, t_start)
 
 
 def _export_channel_inner(client, channel, channel_id, name, oldest, latest, period,
-                          with_threads, reply_executor, incremental, t_start):
+                          with_threads, incremental, t_start):
     path = output_path(channel, period)
 
     existing = load_existing_messages(path) if (incremental and period == "all") else []
@@ -615,7 +582,7 @@ def _export_channel_inner(client, channel, channel_id, name, oldest, latest, per
 
     thread_count = reply_total = replies_calls = 0
     if with_threads:
-        thread_count, reply_total = attach_threads(client, channel_id, messages, reply_executor)
+        thread_count, reply_total = attach_threads(client, channel_id, messages)
         replies_calls = thread_count  # conversations.replies の呼び出し回数（大きいスレッドは ≥1）
     else:
         # 既存ファイルに replies が残っていれば件数だけ拾っておく
@@ -655,13 +622,12 @@ def _export_channel_inner(client, channel, channel_id, name, oldest, latest, per
     return f"✅ #{name} ({channel_id}): メッセージ {len(messages)} 件{detail}{api} → {path}"
 
 
-def export_all_channels(client, channels, with_threads=True, workers=DEFAULT_WORKERS,
-                        skip_existing=False, incremental=False, progress_interval=30.0):
-    """複数チャンネルを並列にエクスポートする。
+def export_all_channels(client, channels, with_threads=True, skip_existing=False,
+                        incremental=False, progress_interval=30.0):
+    """複数チャンネルを直列にエクスポートする。
 
-    - チャンネル単位を workers 本のスレッドプールで並列実行
-    - 各チャンネル内のスレッド返信取得も、全チャンネル共有の workers 本のプールで並列実行
-      （プールを分けることでネスト時のデッドロックを避けつつ、同時 API 呼び出しを ~2*workers に抑える）
+    - 1 チャンネルずつ順番に処理する（並列にしてもレート枠が律速で速度は変わらず、
+      429 とメモリピークだけが増えるため）
     - 実際の送出ペースは PacedWebClient のメソッド単位レートリミッタが律速する
     - incremental=True なら既存 JSON があるチャンネルは新規ぶんだけ取得してマージする
     - progress_interval 秒ごとに送出レート・実効スループット・429 状況を出力（0 で無効）
@@ -686,51 +652,45 @@ def export_all_channels(client, channels, with_threads=True, workers=DEFAULT_WOR
         mode = f"増分取得（既存 {n_update} 件は新規ぶんのみ・残り {total - n_update} 件は全期間）"
     else:
         mode = "全期間エクスポート"
-    print(f"\n🚀 {total} 件のチャンネルを{mode}します{note} / 並列 {workers}")
+    print(f"\n🚀 {total} 件のチャンネルを{mode}します{note} / 直列実行")
     print(f"   送出レート: 初期 {client._start_rate * 60:.0f}/分・上限 {client._max_rate * 60:.0f}/分"
           f"（メソッド毎）。429 で 0.7 倍に減速＋Retry-After ぶん待機、成功が続けば +{_MethodLimiter.INCREASE_STEP_PER_SEC * 60:.0f}/分ずつ復帰（AIMD）")
     if progress_interval > 0:
         print(f"   {progress_interval:.0f} 秒ごとに 📊 進捗行（設定/実効レート・429・取得中チャンネル）を出します")
 
-    inflight = _InFlight()
-    state = {"done": 0}
+    state = {"done": 0, "current": None}
     reporter = None
     if progress_interval > 0:
-        reporter = _StatusReporter(client, progress_interval, inflight,
+        reporter = _StatusReporter(client, progress_interval,
+                                   lambda: state["current"],
                                    lambda: (state["done"], total))
         reporter.start()
 
     t_wall0 = time.monotonic()
-    reply_executor = (ThreadPoolExecutor(max_workers=workers, thread_name_prefix="replies")
-                      if with_threads else None)
     ok = err = 0
     try:
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="channel") as pool:
-            futures = {
-                pool.submit(export_channel, client, c, period="all",
-                            with_threads=with_threads, reply_executor=reply_executor,
-                            incremental=incremental, inflight=inflight): c
-                for c in channels
-            }
-            for fut in as_completed(futures):
-                c = futures[fut]
+        for c in channels:
+            cname = c.get("name", c["id"])
+            state["current"] = cname
+            try:
+                summary = export_channel(client, c, period="all",
+                                         with_threads=with_threads,
+                                         incremental=incremental)
+            except SlackApiError as e:
+                err += 1
                 state["done"] += 1
-                done = state["done"]
-                cname = c.get("name", c["id"])
-                try:
-                    summary = fut.result()
-                except SlackApiError as e:
-                    err += 1
-                    log(f"⚠️  [{done}/{total}] #{cname} をスキップ: {e.response.get('error')}")
-                except Exception as e:  # noqa: BLE001 - 1 チャンネルの失敗で全体を止めない
-                    err += 1
-                    log(f"⚠️  [{done}/{total}] #{cname} で予期しないエラー: {type(e).__name__}: {e}")
-                else:
-                    ok += 1
-                    log(f"[{done}/{total}] {summary}")
+                log(f"⚠️  [{state['done']}/{total}] #{cname} をスキップ: {e.response.get('error')}")
+            except Exception as e:  # noqa: BLE001 - 1 チャンネルの失敗で全体を止めない
+                err += 1
+                state["done"] += 1
+                log(f"⚠️  [{state['done']}/{total}] #{cname} で予期しないエラー: {type(e).__name__}: {e}")
+            else:
+                ok += 1
+                state["done"] += 1
+                log(f"[{state['done']}/{total}] {summary}")
+            finally:
+                state["current"] = None
     finally:
-        if reply_executor is not None:
-            reply_executor.shutdown(wait=True)
         if reporter is not None:
             reporter.stop()
             reporter.join(timeout=2.0)
@@ -844,8 +804,6 @@ def parse_args():
     p.add_argument("--update", "--incremental", dest="update", action="store_true",
                    help=("増分取得。既存の出力 JSON があれば保存済みの最新メッセージ以降だけ取得して"
                          "マージする（全期間モード時のみ有効。--skip-existing より優先）"))
-    p.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
-                   help=f"並列ワーカー数（チャンネル並列・スレッド返信並列の各プールの本数 / デフォルト: {DEFAULT_WORKERS}）")
     p.add_argument("--start-rate", type=float, default=DEFAULT_START_RATE_PER_MIN, dest="start_rate",
                    help=("メソッドごとの初期送出レート（req/分）。429 を踏むと自動で 0.7 倍に減速し、"
                          f"成功が続けば --max-rate まで増える（デフォルト: {DEFAULT_START_RATE_PER_MIN:.0f}）"))
@@ -865,7 +823,6 @@ def main():
     args = parse_args()
     client = build_client(args.start_rate, args.max_retries, max_rate_per_min=args.max_rate)
     with_threads = not args.no_threads
-    workers = max(1, args.workers)
     types = "public_channel,private_channel" + (",im,mpim" if args.include_dms else "")
 
     try:
@@ -885,7 +842,7 @@ def main():
 
             if args.all_channels:
                 export_all_channels(client, channels, with_threads=with_threads,
-                                    workers=workers, skip_existing=args.skip_existing,
+                                    skip_existing=args.skip_existing,
                                     incremental=args.update,
                                     progress_interval=max(0.0, args.progress_interval))
             elif args.join_public:
@@ -915,15 +872,9 @@ def main():
             print(f"⏭️  既に取得済みです: {output_path(channel, period)}")
             return
 
-        reply_executor = (ThreadPoolExecutor(max_workers=workers, thread_name_prefix="replies")
-                          if with_threads else None)
-        try:
-            log(export_channel(client, channel, oldest=oldest, latest=latest,
-                               period=period, with_threads=with_threads,
-                               reply_executor=reply_executor, incremental=incremental))
-        finally:
-            if reply_executor is not None:
-                reply_executor.shutdown(wait=True)
+        log(export_channel(client, channel, oldest=oldest, latest=latest,
+                           period=period, with_threads=with_threads,
+                           incremental=incremental))
 
     except SlackApiError as e:
         err = e.response.get("error")
