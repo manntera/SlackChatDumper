@@ -404,13 +404,19 @@ def newest_message_ts(messages):
 
 
 def merge_messages(old_messages, new_messages):
-    """ts をキーに新旧をマージ（同 ts は新を採用）。Slack の history と同じ「新しい順」で返す。"""
+    """ts をキーに新旧をマージ（同 ts は新を採用）。Slack の history と同じ「新しい順」で返す。
+
+    NOTE: 入力 list は pop で消費するため呼び出し後は空になる。巨大チャンネルで「old+new+結果」
+    の三重持ちを避けるため、要素を順次 by_ts に移し替えてから sort する。
+    """
     by_ts = {}
-    for m in old_messages:
+    while old_messages:
+        m = old_messages.pop()
         ts = m.get("ts")
         if ts:
             by_ts[ts] = m
-    for m in new_messages:
+    while new_messages:
+        m = new_messages.pop()
         ts = m.get("ts")
         if ts:
             by_ts[ts] = m
