@@ -46,6 +46,7 @@
 """
 
 import argparse
+import gc
 import json
 import os
 import re
@@ -704,6 +705,9 @@ def export_all_channels(client, channels, with_threads=True, skip_existing=False
                 log(f"[{state['done']}/{total}] {summary}")
             finally:
                 state["current"] = None
+                # 巨大チャンネル直後にスレッド返信由来の循環参照が残ると次チャンネル処理開始時の
+                # RSS ピークが下がらないので、ここで明示的に回収する（高々数十 ms）
+                gc.collect()
     finally:
         if reporter is not None:
             reporter.stop()
