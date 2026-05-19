@@ -584,7 +584,12 @@ def _export_channel_inner(client, channel, channel_id, name, oldest, latest, per
     new_messages, hist_pages = fetch_history(client, channel_id, oldest, latest,
                                              inclusive=fetch_inclusive)
     new_count = len(new_messages)
-    messages = merge_messages(existing, new_messages) if existing else new_messages
+    if existing:
+        messages = merge_messages(existing, new_messages)
+        del existing, new_messages  # merge_messages が中身を pop し尽くした空 list
+    else:
+        messages = new_messages
+        del new_messages
 
     thread_count = reply_total = replies_calls = 0
     if with_threads:
@@ -598,12 +603,13 @@ def _export_channel_inner(client, channel, channel_id, name, oldest, latest, per
                 thread_count += 1
                 reply_total += len(r)
 
+    msg_count = len(messages)  # json.dump 後に messages を解放するため先に取っておく
     payload = {
         "channel": channel_id,
         "channel_name": channel.get("name"),
         "is_private": channel.get("is_private"),
         "period": period,
-        "message_count": len(messages),
+        "message_count": msg_count,
         "thread_count": thread_count,
         "reply_count": reply_total,
         "exported_at": datetime.now().isoformat(timespec="seconds"),
@@ -615,17 +621,19 @@ def _export_channel_inner(client, channel, channel_id, name, oldest, latest, per
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)  # 中断時に壊れた JSON を残さない（--skip-existing の判定も安全に）
+    # 巨大チャンネルだと完了行を組み立てている間も RAM に居座るので、ここで明示的に手放す。
+    del payload, messages
 
     elapsed = time.monotonic() - t_start
     api_calls = hist_pages + replies_calls
-    msg_per_s = len(messages) / elapsed if elapsed > 0 else 0.0
+    msg_per_s = msg_count / elapsed if elapsed > 0 else 0.0
     detail = f" / スレッド {thread_count} 件・返信 {reply_total} 件" if with_threads else ""
     api = (f" ｜ {_fmt_secs(elapsed)} / API {api_calls} 回(history {hist_pages}＋replies {replies_calls})"
            f" / {msg_per_s:.0f} msg/s")
     if resume_ts is not None:
-        return (f"🔄 #{name} ({channel_id}): 新規 {new_count} 件 → 合計 {len(messages)} 件"
+        return (f"🔄 #{name} ({channel_id}): 新規 {new_count} 件 → 合計 {msg_count} 件"
                 f"{detail}{api} → {path}")
-    return f"✅ #{name} ({channel_id}): メッセージ {len(messages)} 件{detail}{api} → {path}"
+    return f"✅ #{name} ({channel_id}): メッセージ {msg_count} 件{detail}{api} → {path}"
 
 
 def export_all_channels(client, channels, with_threads=True, skip_existing=False,
