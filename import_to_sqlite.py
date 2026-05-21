@@ -280,8 +280,39 @@ def _file_rows(channel_id: str, ts: str, files: Iterable[dict]) -> list[dict]:
     return rows
 
 
+FILES_UPSERT_SQL = """
+    INSERT INTO files (channel_id, ts, file_id, name, title, mimetype,
+                       filetype, size, user, url_private, permalink, raw)
+    VALUES (:channel_id, :ts, :file_id, :name, :title, :mimetype,
+            :filetype, :size, :user, :url_private, :permalink, :raw)
+    ON CONFLICT(channel_id, ts, file_id) DO UPDATE SET
+        name        = excluded.name,
+        title       = excluded.title,
+        mimetype    = excluded.mimetype,
+        filetype    = excluded.filetype,
+        size        = excluded.size,
+        user        = excluded.user,
+        url_private = excluded.url_private,
+        permalink   = excluded.permalink,
+        raw         = excluded.raw
+"""
+
+REACTIONS_INSERT_SQL = (
+    "INSERT OR IGNORE INTO reactions (channel_id, ts, name, user) VALUES (?, ?, ?, ?)"
+)
+
+# Pass 2 で executemany にまとめる「行数」の目安。大きすぎると buffer がメモリを食い、
+# 小さすぎると executemany 呼び出しのオーバーヘッドが増える。1000 件 ≒ 数 MB が落としどころ。
+_FLUSH_EVERY_MSGS = 1000
+
+
 def import_channel_file(conn: sqlite3.Connection, path: str) -> dict[str, int]:
-    """1 つの slack_*.json を取り込む。戻り値は件数。"""
+    """1 つの slack_*.json を取り込む。戻り値は件数。
+
+    巨大チャンネルでもメモリピークが「JSON 全件 ＋ 全行リスト」と二重持ちにならないよう、
+    messages を pop で消費しながら一定件数ごとに executemany する（commit はファイル単位で
+    1 回だけ。アトミック性は従来通り維持）。
+    """
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
 
@@ -316,30 +347,25 @@ def import_channel_file(conn: sqlite3.Connection, path: str) -> dict[str, int]:
         ),
     )
 
-    msg_rows: list[dict] = []
-    reaction_tuples: list[tuple] = []
-    file_rows: list[dict] = []
-    affected_ts: set[str] = set()
+    messages_in = data.get("messages") or []
+    del data  # ラッパー dict は不要。messages_in 経由でメッセージ本体だけ握る。
+    # pop() は O(1) で末尾から取り出すので、元の JSON 順を保つよう先に反転しておく。
+    # 反転しないと「同じ ts が top-level と reply の両方に出てくる」希少ケースで
+    # UPSERT の最終勝者が変わり、parent_ts / is_reply の値が元コードと食い違う。
+    messages_in.reverse()
 
-    for m in data.get("messages") or []:
+    # Pass 1: affected_ts を集める（ts 文字列だけなので軽い）。reactions / files を消すために必須。
+    affected_ts: set[str] = set()
+    for m in messages_in:
         ts = m.get("ts")
         if not ts:
             continue
-        msg_rows.append(_msg_row(channel_id, m, parent_ts=None))
         affected_ts.add(ts)
-        reaction_tuples.extend(_reaction_rows(channel_id, ts, m.get("reactions")))
-        file_rows.extend(_file_rows(channel_id, ts, m.get("files")))
-
         for r in m.get("replies") or []:
             rts = r.get("ts")
-            if not rts:
-                continue
-            msg_rows.append(_msg_row(channel_id, r, parent_ts=ts))
-            affected_ts.add(rts)
-            reaction_tuples.extend(_reaction_rows(channel_id, rts, r.get("reactions")))
-            file_rows.extend(_file_rows(channel_id, rts, r.get("files")))
+            if rts:
+                affected_ts.add(rts)
 
-    # 既存の reactions / files をいったん消して入れ直す（更新差分を反映するため）
     if affected_ts:
         ts_list = list(affected_ts)
         # SQLite のパラメータ数上限を避けるためチャンクで削除
@@ -355,39 +381,50 @@ def import_channel_file(conn: sqlite3.Connection, path: str) -> dict[str, int]:
                 f"DELETE FROM files WHERE channel_id = ? AND ts IN ({placeholders})",
                 [channel_id, *chunk],
             )
+        del ts_list
+    del affected_ts
 
-    conn.executemany(MSG_UPSERT_SQL, msg_rows)
-    if reaction_tuples:
-        conn.executemany(
-            "INSERT OR IGNORE INTO reactions (channel_id, ts, name, user) VALUES (?, ?, ?, ?)",
-            reaction_tuples,
-        )
-    if file_rows:
-        conn.executemany(
-            """
-            INSERT INTO files (channel_id, ts, file_id, name, title, mimetype,
-                               filetype, size, user, url_private, permalink, raw)
-            VALUES (:channel_id, :ts, :file_id, :name, :title, :mimetype,
-                    :filetype, :size, :user, :url_private, :permalink, :raw)
-            ON CONFLICT(channel_id, ts, file_id) DO UPDATE SET
-                name        = excluded.name,
-                title       = excluded.title,
-                mimetype    = excluded.mimetype,
-                filetype    = excluded.filetype,
-                size        = excluded.size,
-                user        = excluded.user,
-                url_private = excluded.url_private,
-                permalink   = excluded.permalink,
-                raw         = excluded.raw
-            """,
-            file_rows,
-        )
+    # Pass 2: pop しながら N 件単位で executemany し、その都度 buffer を捨てて RAM を返す。
+    totals = {"messages": 0, "reactions": 0, "files": 0}
+    msg_buf: list[dict] = []
+    react_buf: list[tuple] = []
+    file_buf: list[dict] = []
+
+    def _flush() -> None:
+        if msg_buf:
+            conn.executemany(MSG_UPSERT_SQL, msg_buf)
+            totals["messages"] += len(msg_buf)
+            msg_buf.clear()
+        if react_buf:
+            conn.executemany(REACTIONS_INSERT_SQL, react_buf)
+            totals["reactions"] += len(react_buf)
+            react_buf.clear()
+        if file_buf:
+            conn.executemany(FILES_UPSERT_SQL, file_buf)
+            totals["files"] += len(file_buf)
+            file_buf.clear()
+
+    while messages_in:
+        m = messages_in.pop()
+        ts = m.get("ts")
+        if not ts:
+            continue
+        msg_buf.append(_msg_row(channel_id, m, parent_ts=None))
+        react_buf.extend(_reaction_rows(channel_id, ts, m.get("reactions")))
+        file_buf.extend(_file_rows(channel_id, ts, m.get("files")))
+        for r in m.get("replies") or []:
+            rts = r.get("ts")
+            if not rts:
+                continue
+            msg_buf.append(_msg_row(channel_id, r, parent_ts=ts))
+            react_buf.extend(_reaction_rows(channel_id, rts, r.get("reactions")))
+            file_buf.extend(_file_rows(channel_id, rts, r.get("files")))
+        if len(msg_buf) >= _FLUSH_EVERY_MSGS:
+            _flush()
+
+    _flush()
     conn.commit()
-    return {
-        "messages": len(msg_rows),
-        "reactions": len(reaction_tuples),
-        "files": len(file_rows),
-    }
+    return totals
 
 
 def discover_channel_files(result_dir: str) -> list[str]:
