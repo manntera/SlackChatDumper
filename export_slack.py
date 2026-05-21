@@ -10,6 +10,7 @@
     python export_slack.py --all-channels          # 参照可能な全チャンネルを全期間エクスポート
     python export_slack.py --all-channels --skip-existing  # 取得済みは飛ばす（中断後の再開）
     python export_slack.py --all-channels --update         # 既存ファイルがあれば新規ぶんだけ取得してマージ（増分取得）
+    python export_slack.py --all-channels --update --reply-refresh-days 14  # 増分時に既存スレッド返信を取り直す窓（日）
     python export_slack.py --all-channels --include-dms    # DM / グループDM も含める
     python export_slack.py --all-channels --no-threads     # スレッド返信は取得しない
     python export_slack.py --all-channels --start-rate 12  # 初期送出レート(req/分・メソッド毎)
@@ -37,11 +38,17 @@
 
 増分取得（--update）について:
     既に出力した JSON があるチャンネルは、保存済みメッセージの中で最も新しい ts 以降だけを
-    conversations.history で取得して既存ぶんとマージします（全期間モード時のみ有効）。スレッド返信は
-    マージ後の全スレッド親について再取得するので、既存スレッドへの新着返信も拾えます。
+    conversations.history で取得して既存ぶんとマージします（全期間モード時のみ有効）。
     既存ファイルが無いチャンネルは通常どおり全期間を取得します。
-    ※ 仕様上の限界: 前回取得より古いメッセージの「編集・削除」、および古いメッセージに後から
-      ぶら下がった「新規スレッド」は反映されません。これらも正確に取りたい時は --update なしで
+    スレッド返信(conversations.replies)は全スレッド親を取り直すと増分でも全取得と同じ時間が
+    かかる（replies の呼び出し回数が history のページ数を桁違いに上回るため）ので、
+      (1) 今回新しく取れたスレッド親、
+      (2) 既存スレッド親のうち最終返信(latest_reply)が直近 --reply-refresh-days 日以内のもの、
+    だけ取り直し、それ以外は保存済みの返信をそのまま流用します（--reply-refresh-days の
+    デフォルトは 7。0 で新規スレッドのみ・十分大きな値で全スレッド再取得相当）。
+    ※ 仕様上の限界: 前回取得より古いメッセージの「編集・削除」、古いメッセージに後から
+      ぶら下がった「新規スレッド」、および --reply-refresh-days 日より長く沈黙していた
+      スレッドへの新着返信は反映されません。これらも正確に取りたい時は --update なしで
       たまにフル再取得してください。
 """
 
@@ -68,6 +75,9 @@ MIN_RATE_PER_MIN = 1.0              # これ以上は下げない（実際の待
 # 429→Retry-After 待機のロスが増えてむしろ遅くなるので、控えめに 60。--max-rate で実行時に変更可。
 DEFAULT_MAX_RATE_PER_MIN = 60.0
 DEFAULT_MAX_RETRIES = 50            # 1 リクエストあたりの 429 リトライ上限（0 = 無制限）
+# --update 時に既存スレッドの返信を取り直す「窓」。最終返信(latest_reply)がこの日数以内の
+# スレッドだけ replies を再取得し、それ以外は保存済みの返信を流用する（--reply-refresh-days）。
+DEFAULT_REPLY_REFRESH_DAYS = 7.0
 
 # StatusReporter（別スレッド）と main の print が混ざらないようにするためのロック
 _print_lock = threading.Lock()
@@ -528,22 +538,54 @@ def fetch_replies(client, channel_id, thread_ts):
     return replies[1:] if replies else []
 
 
-def attach_threads(client, channel_id, messages):
+def _needs_reply_refresh(msg, resume_f, refresh_cutoff):
+    """増分取得でこのスレッド親の replies を取り直す必要があるか。
+
+    取り直す: (1) resume_ts 以降に取れた新しい親、(2) まだ replies を持たない親
+    （前回 --no-threads だった等）、(3) 最終返信(latest_reply)が refresh_cutoff 以降の親。
+    それ以外（=最終返信が窓より古い親）は保存済みの replies を流用する。
+    """
+    ts = msg.get("ts")
+    if ts is not None and float(ts) >= resume_f:
+        return True
+    if not isinstance(msg.get("replies"), list):
+        return True
+    latest = msg.get("latest_reply")
+    if latest is None:
+        return True  # 最終返信時刻が不明なら安全側で取り直す
+    return float(latest) >= refresh_cutoff
+
+
+def attach_threads(client, channel_id, messages, resume_ts=None, refresh_cutoff=None):
     """history で得たメッセージのうちスレッド親に、replies を付与する（直列取得）。
 
     並列にしてもレート枠が律速するので速くはならず、429 と一時メモリだけが増える。
+
+    増分取得（resume_ts を渡したとき）は全スレッド親を取り直さず、_needs_reply_refresh が
+    True を返した親だけ replies を取り直し、それ以外は保存済みの replies を流用する。
+    戻り値: (スレッド親数, 返信総数, replies を実際に取得した親数)。
     """
     parents = [m for m in messages
                if m.get("ts") and m.get("thread_ts") == m["ts"] and m.get("reply_count", 0) > 0]
     if not parents:
-        return 0, 0
+        return 0, 0, 0
 
+    resume_f = float(resume_ts) if resume_ts is not None else None
     reply_total = 0
+    fetched = 0
     for msg in parents:
+        if resume_f is not None and not _needs_reply_refresh(msg, resume_f, refresh_cutoff):
+            reply_total += len(msg.get("replies") or [])  # 保存済みの replies を流用
+            continue
         replies = fetch_replies(client, channel_id, msg["ts"])
         msg["replies"] = replies
+        # 次回 --update の窓判定が正確になるよう、スレッドのメタ情報も最新化しておく
+        msg["reply_count"] = len(replies)
+        if replies:
+            msg["latest_reply"] = replies[-1].get("ts") or msg.get("latest_reply")
         reply_total += len(replies)
-    return len(parents), reply_total
+        fetched += 1
+    return len(parents), reply_total, fetched
 
 
 def get_channel_info(client, channel_id):
@@ -557,21 +599,23 @@ def get_channel_info(client, channel_id):
 # エクスポート
 # --------------------------------------------------------------------------- #
 def export_channel(client, channel, oldest=None, latest=None, period="all",
-                   with_threads=True, incremental=False):
+                   with_threads=True, incremental=False,
+                   reply_refresh_days=DEFAULT_REPLY_REFRESH_DAYS):
     """1 チャンネル分を取得して JSON に書き出す。完了行（文字列）を返す。
 
     incremental=True かつ period=="all" なら、既存 JSON があれば保存済みの最新 ts 以降だけを
-    取得して既存ぶんとマージする（スレッド返信はマージ後の全スレッド親を再取得して最新化）。
+    取得して既存ぶんとマージする。スレッド返信は新規スレッドと、最終返信が直近
+    reply_refresh_days 日以内の既存スレッドだけ取り直し、それ以外は保存済みの返信を流用する。
     """
     channel_id = channel["id"]
     name = channel.get("name") or channel_id
     t_start = time.monotonic()
     return _export_channel_inner(client, channel, channel_id, name, oldest, latest, period,
-                                 with_threads, incremental, t_start)
+                                 with_threads, incremental, reply_refresh_days, t_start)
 
 
 def _export_channel_inner(client, channel, channel_id, name, oldest, latest, period,
-                          with_threads, incremental, t_start):
+                          with_threads, incremental, reply_refresh_days, t_start):
     path = output_path(channel, period)
 
     existing = load_existing_messages(path) if (incremental and period == "all") else []
@@ -594,8 +638,13 @@ def _export_channel_inner(client, channel, channel_id, name, oldest, latest, per
 
     thread_count = reply_total = replies_calls = 0
     if with_threads:
-        thread_count, reply_total = attach_threads(client, channel_id, messages)
-        replies_calls = thread_count  # conversations.replies の呼び出し回数（大きいスレッドは ≥1）
+        refresh_cutoff = None
+        if resume_ts is not None:
+            # 最終返信がこの時刻以降の既存スレッドだけ replies を取り直す
+            refresh_cutoff = time.time() - max(0.0, reply_refresh_days) * 86400.0
+        # replies_calls = conversations.replies を実際に呼んだ親数（増分時は窓内のぶんだけ）
+        thread_count, reply_total, replies_calls = attach_threads(
+            client, channel_id, messages, resume_ts=resume_ts, refresh_cutoff=refresh_cutoff)
     else:
         # 既存ファイルに replies が残っていれば件数だけ拾っておく
         for m in messages:
@@ -628,7 +677,14 @@ def _export_channel_inner(client, channel, channel_id, name, oldest, latest, per
     elapsed = time.monotonic() - t_start
     api_calls = hist_pages + replies_calls
     msg_per_s = msg_count / elapsed if elapsed > 0 else 0.0
-    detail = f" / スレッド {thread_count} 件・返信 {reply_total} 件" if with_threads else ""
+    if not with_threads:
+        detail = ""
+    elif resume_ts is not None:
+        # 増分時は「replies を取り直した親数 / 保存済みを流用した親数」を明示する
+        detail = (f" / スレッド {thread_count} 件・返信 {reply_total} 件"
+                  f"（replies 再取得 {replies_calls}・流用 {thread_count - replies_calls}）")
+    else:
+        detail = f" / スレッド {thread_count} 件・返信 {reply_total} 件"
     api = (f" ｜ {_fmt_secs(elapsed)} / API {api_calls} 回(history {hist_pages}＋replies {replies_calls})"
            f" / {msg_per_s:.0f} msg/s")
     if resume_ts is not None:
@@ -638,13 +694,15 @@ def _export_channel_inner(client, channel, channel_id, name, oldest, latest, per
 
 
 def export_all_channels(client, channels, with_threads=True, skip_existing=False,
-                        incremental=False, progress_interval=30.0):
+                        incremental=False, progress_interval=30.0,
+                        reply_refresh_days=DEFAULT_REPLY_REFRESH_DAYS):
     """複数チャンネルを直列にエクスポートする。
 
     - 1 チャンネルずつ順番に処理する（並列にしてもレート枠が律速で速度は変わらず、
       429 とメモリピークだけが増えるため）
     - 実際の送出ペースは PacedWebClient のメソッド単位レートリミッタが律速する
     - incremental=True なら既存 JSON があるチャンネルは新規ぶんだけ取得してマージする
+      （既存スレッドの返信は最終返信が直近 reply_refresh_days 日以内のものだけ取り直す）
     - progress_interval 秒ごとに送出レート・実効スループット・429 状況を出力（0 で無効）
     """
     if skip_existing and incremental:
@@ -670,6 +728,9 @@ def export_all_channels(client, channels, with_threads=True, skip_existing=False
     print(f"\n🚀 {total} 件のチャンネルを{mode}します{note} / 直列実行")
     print(f"   送出レート: 初期 {client._start_rate * 60:.0f}/分・上限 {client._max_rate * 60:.0f}/分"
           f"（メソッド毎）。429 で 0.7 倍に減速＋Retry-After ぶん待機、成功が続けば +{_MethodLimiter.INCREASE_STEP_PER_SEC * 60:.0f}/分ずつ復帰（AIMD）")
+    if incremental and with_threads:
+        print(f"   スレッド返信: 新規スレッドと、最終返信が直近 {reply_refresh_days:.0f} 日以内の"
+              f"既存スレッドだけ取り直します（--reply-refresh-days）")
     if progress_interval > 0:
         print(f"   {progress_interval:.0f} 秒ごとに 📊 進捗行（設定/実効レート・429・取得中チャンネル）を出します")
 
@@ -690,7 +751,8 @@ def export_all_channels(client, channels, with_threads=True, skip_existing=False
             try:
                 summary = export_channel(client, c, period="all",
                                          with_threads=with_threads,
-                                         incremental=incremental)
+                                         incremental=incremental,
+                                         reply_refresh_days=reply_refresh_days)
             except SlackApiError as e:
                 err += 1
                 state["done"] += 1
@@ -822,6 +884,12 @@ def parse_args():
     p.add_argument("--update", "--incremental", dest="update", action="store_true",
                    help=("増分取得。既存の出力 JSON があれば保存済みの最新メッセージ以降だけ取得して"
                          "マージする（全期間モード時のみ有効。--skip-existing より優先）"))
+    p.add_argument("--reply-refresh-days", type=float, default=DEFAULT_REPLY_REFRESH_DAYS,
+                   dest="reply_refresh_days",
+                   help=("--update 時、既存スレッドの返信(conversations.replies)を取り直す窓（日）。"
+                         "最終返信(latest_reply)がこの日数以内のスレッドだけ再取得し、それ以外は"
+                         "保存済みの返信を流用する。0 で新規スレッドのみ・十分大きな値で全スレッド"
+                         f"再取得相当（デフォルト: {DEFAULT_REPLY_REFRESH_DAYS:.0f}）"))
     p.add_argument("--start-rate", type=float, default=DEFAULT_START_RATE_PER_MIN, dest="start_rate",
                    help=("メソッドごとの初期送出レート（req/分）。429 を踏むと自動で 0.7 倍に減速し、"
                          f"成功が続けば --max-rate まで増える（デフォルト: {DEFAULT_START_RATE_PER_MIN:.0f}）"))
@@ -862,7 +930,8 @@ def main():
                 export_all_channels(client, channels, with_threads=with_threads,
                                     skip_existing=args.skip_existing,
                                     incremental=args.update,
-                                    progress_interval=max(0.0, args.progress_interval))
+                                    progress_interval=max(0.0, args.progress_interval),
+                                    reply_refresh_days=args.reply_refresh_days)
             elif args.join_public:
                 print("\nℹ️  参加だけ完了しました。エクスポートも行うには --all-channels を付けて再実行してください。")
             return
@@ -892,7 +961,8 @@ def main():
 
         log(export_channel(client, channel, oldest=oldest, latest=latest,
                            period=period, with_threads=with_threads,
-                           incremental=incremental))
+                           incremental=incremental,
+                           reply_refresh_days=args.reply_refresh_days))
 
     except SlackApiError as e:
         err = e.response.get("error")
