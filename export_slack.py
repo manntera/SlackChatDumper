@@ -450,6 +450,26 @@ def list_channels(client, include_archived=True):
     return channels
 
 
+def filter_excluded(channels, exclude):
+    """config の exclude_channels（名前 or ID のリスト）に該当するチャンネルを除く。
+
+    ID は完全一致、名前は先頭 `#` の有無と大文字小文字を無視して一致させる。
+    戻り値は (残すチャンネル, 除外したチャンネル)。
+    """
+    if not exclude:
+        return channels, []
+    ids = {str(e).strip() for e in exclude if str(e).strip()}            # ID は完全一致
+    names = {str(e).strip().lstrip("#").lower() for e in exclude if str(e).strip()}
+    kept, removed = [], []
+    for c in channels:
+        name = (c.get("name") or "").lower()
+        if c.get("id") in ids or name in names:
+            removed.append(c)
+        else:
+            kept.append(c)
+    return kept, removed
+
+
 def list_users(client):
     """ワークスペースの全ユーザーを users.list で取得する（削除済み・BOT も含む）。
 
@@ -751,7 +771,7 @@ def export_all_channels(client, channels, with_threads=True, skip_existing=False
     print("🎉 完了しました（スキップが出た場合は --skip-existing を付けて再実行できます）")
 
 
-def dump_channel_list(channels):
+def dump_channel_list(channels, excluded=None):
     os.makedirs(RESULT_DIR, exist_ok=True)
     path = os.path.join(RESULT_DIR, "channels.json")
     with open(path, "w", encoding="utf-8") as f:
@@ -761,6 +781,9 @@ def dump_channel_list(channels):
         members = c.get("num_members")
         members = f"  ({members}名)" if members is not None else ""
         print(f"  ＃ {c.get('name', c['id']):<32} {c['id']}{members}")
+    if excluded:
+        names = ", ".join(f"#{c.get('name', c['id'])}" for c in excluded)
+        print(f"🚫 除外 {len(excluded)} 件（config.json の exclude_channels）: {names}")
     print(f"→ 一覧を {path} に保存しました")
     return path
 
@@ -862,7 +885,8 @@ def main():
 
         if args.list_only or args.all_channels:
             channels = list_channels(client, include_archived=not args.exclude_archived)
-            dump_channel_list(channels)
+            channels, excluded = filter_excluded(channels, load_config().get("exclude_channels"))
+            dump_channel_list(channels, excluded)
 
             if args.all_channels:
                 export_all_channels(client, channels, with_threads=with_threads,
