@@ -5,19 +5,17 @@
     python export_slack.py <channel_id> <date>     # 日付(YYYY-MM-DD)指定
     python export_slack.py <channel_id> all        # 全期間
     python export_slack.py --all                   # config のチャンネルを全期間
-    python export_slack.py --list                  # BOT が参照可能なチャンネル一覧
+    python export_slack.py --list                  # 参照可能な公開チャンネル一覧
     python export_slack.py --list-users            # ワークスペースの全ユーザー一覧 (要 users:read[, users:read.email])
     python export_slack.py --all-channels          # 参照可能な全チャンネルを全期間エクスポート
     python export_slack.py --all-channels --skip-existing  # 取得済みは飛ばす（中断後の再開）
     python export_slack.py --all-channels --update         # 既存ファイルがあれば新規ぶんだけ取得してマージ（増分取得）
     python export_slack.py --all-channels --update --reply-refresh-days 14  # 増分時に既存スレッド返信を取り直す窓（日）
-    python export_slack.py --all-channels --include-dms    # DM / グループDM も含める
+    python export_slack.py --all-channels --include-archived  # アーカイブ済み公開チャンネルも含める（要 User トークン）
     python export_slack.py --all-channels --no-threads     # スレッド返信は取得しない
     python export_slack.py --all-channels --start-rate 12  # 初期送出レート(req/分・メソッド毎)
     python export_slack.py --all-channels --max-rate 120  # 送出レート上限(req/分・メソッド毎)を引き上げて速度を探る
     python export_slack.py --all-channels --progress-interval 10  # 10 秒ごとに進捗・レート・429 を出力（0 で無効）
-    python export_slack.py --join-public           # 全公開チャンネルに BOT を自動参加（要 channels:join）
-    python export_slack.py --all-channels --join-public   # 全公開チャンネルに参加してエクスポート
 
 レート制限と取得方針について:
     Slack のレート制限は「メソッド単位 × ワークスペース単位」で課されます。コネクション（並列数）
@@ -437,66 +435,19 @@ def merge_messages(old_messages, new_messages):
 # --------------------------------------------------------------------------- #
 # Slack API 呼び出し（SlackResponse はイテレートすると自動でページネーションされる）
 # --------------------------------------------------------------------------- #
-def list_channels(client, types):
-    """BOT 自身がメンバーになっている（＝履歴を読める）会話の一覧。
+def list_channels(client, include_archived=False):
+    """ワークスペースの公開チャンネル一覧を返す（参加・未参加を問わない）。
 
-    conversations.list はワークスペースの全公開チャンネルを返してしまうため、
-    「BOT が確認可能なチャンネル」は users.conversations を使う。
+    User トークンなら未参加の公開チャンネルも履歴を読めるため、参加有無で絞らず
+    conversations.list で全公開チャンネルを列挙する。include_archived=True の
+    ときはアーカイブ済みも含める。非公開チャンネル・DM は対象外。
     """
-    def _fetch(t):
-        out = []
-        for page in client.users_conversations(types=t, limit=200, exclude_archived=True):
-            out.extend(page["channels"])
-        return out
-
-    try:
-        channels = _fetch(types)
-    except SlackApiError as e:
-        # スコープ不足で一部の種別が取れないときは public_channel だけにフォールバック
-        if e.response.get("error") == "missing_scope" and types != "public_channel":
-            print(f"⚠️  {e.response.get('needed')} スコープが無いため public_channel のみを対象にします")
-            channels = _fetch("public_channel")
-        else:
-            raise
-    channels.sort(key=lambda c: c.get("name") or c.get("id", ""))
-    return channels
-
-
-def list_all_public_channels(client):
     channels = []
-    for page in client.conversations_list(types="public_channel", limit=200, exclude_archived=True):
+    for page in client.conversations_list(types="public_channel", limit=200,
+                                           exclude_archived=not include_archived):
         channels.extend(page["channels"])
     channels.sort(key=lambda c: c.get("name") or c.get("id", ""))
     return channels
-
-
-def join_public_channels(client):
-    """ワークスペースの全公開チャンネルを列挙し、未参加のものに BOT を参加させる。
-
-    参加に成功した（または元から参加済みの）チャンネルだけを返す。
-    """
-    channels = list_all_public_channels(client)
-    to_join = [c for c in channels if not c.get("is_member")]
-    if not to_join:
-        print(f"➕ 公開チャンネル {len(channels)} 件すべてに参加済みです")
-        return channels
-
-    print(f"➕ 未参加の公開チャンネル {len(to_join)} 件に BOT を参加させます ...")
-    for i, c in enumerate(to_join, 1):
-        name = c.get("name", c["id"])
-        try:
-            client.conversations_join(channel=c["id"])
-            c["is_member"] = True
-            print(f"  [{i}/{len(to_join)}] joined #{name}")
-        except SlackApiError as e:
-            err = e.response.get("error")
-            if err == "missing_scope":
-                print(f"❌ チャンネル参加には channels:join スコープが必要です "
-                      f"(必要: {e.response.get('needed')} / 現在: {e.response.get('provided')})")
-                print("   Slack App 設定で channels:join を追加し、ワークスペースに再インストールしてください。")
-                raise SystemExit(1)
-            print(f"  [{i}/{len(to_join)}] ⚠️ #{name} 参加失敗: {err}")
-    return [c for c in channels if c.get("is_member")]
 
 
 def list_users(client):
@@ -805,17 +756,11 @@ def dump_channel_list(channels):
     path = os.path.join(RESULT_DIR, "channels.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(channels, f, ensure_ascii=False, indent=2)
-    print(f"📋 BOT が参照可能なチャンネル {len(channels)} 件:")
+    print(f"📋 参照可能な公開チャンネル {len(channels)} 件:")
     for c in channels:
-        if c.get("is_im") or c.get("is_mpim"):
-            mark = "💬"
-        elif c.get("is_private"):
-            mark = "🔒"
-        else:
-            mark = "＃ "
         members = c.get("num_members")
         members = f"  ({members}名)" if members is not None else ""
-        print(f"  {mark} {c.get('name', c['id']):<32} {c['id']}{members}")
+        print(f"  ＃ {c.get('name', c['id']):<32} {c['id']}{members}")
     print(f"→ 一覧を {path} に保存しました")
     return path
 
@@ -868,17 +813,16 @@ def parse_args():
                    help=f"取得する日付 YYYY-MM-DD または all (デフォルト: {default_date})")
     p.add_argument("--all", action="store_true", help="全期間のメッセージを取得する")
     p.add_argument("--list", dest="list_only", action="store_true",
-                   help="BOT が参照可能なチャンネル一覧を表示し result/channels.json に保存する")
+                   help="参照可能な公開チャンネル一覧を表示し result/channels.json に保存する")
     p.add_argument("--list-users", dest="list_users", action="store_true",
                    help="ワークスペースの全ユーザー一覧を result/users.json に保存する（要 users:read）")
     p.add_argument("--all-channels", dest="all_channels", action="store_true",
                    help="参照可能な全チャンネルを全期間エクスポートする")
-    p.add_argument("--join-public", dest="join_public", action="store_true",
-                   help="ワークスペースの全公開チャンネルに BOT を自動参加させてから対象にする")
     p.add_argument("--no-threads", dest="no_threads", action="store_true",
                    help="スレッド返信を取得しない")
-    p.add_argument("--include-dms", dest="include_dms", action="store_true",
-                   help="DM / グループDM も対象に含める（--join-public とは併用不可）")
+    p.add_argument("--include-archived", dest="include_archived", action="store_true",
+                   help=("アーカイブ済みチャンネルも対象に含める（--list / --all-channels）。"
+                         "未参加の公開チャンネルも列挙するため、履歴取得には User トークン(xoxp-)が必要"))
     p.add_argument("--skip-existing", dest="skip_existing", action="store_true",
                    help="出力 JSON が既にあるチャンネルはスキップする（中断後の再実行に便利）")
     p.add_argument("--update", "--incremental", dest="update", action="store_true",
@@ -909,7 +853,6 @@ def main():
     args = parse_args()
     client = build_client(args.start_rate, args.max_retries, max_rate_per_min=args.max_rate)
     with_threads = not args.no_threads
-    types = "public_channel,private_channel" + (",im,mpim" if args.include_dms else "")
 
     try:
         if args.list_users:
@@ -917,13 +860,8 @@ def main():
             dump_user_list(users)
             return
 
-        if args.list_only or args.all_channels or args.join_public:
-            if args.join_public:
-                if args.include_dms:
-                    print("⚠️  --join-public 指定時は --include-dms は無視されます（公開チャンネルのみ対象）")
-                channels = join_public_channels(client)
-            else:
-                channels = list_channels(client, types)
+        if args.list_only or args.all_channels:
+            channels = list_channels(client, include_archived=args.include_archived)
             dump_channel_list(channels)
 
             if args.all_channels:
@@ -932,8 +870,6 @@ def main():
                                     incremental=args.update,
                                     progress_interval=max(0.0, args.progress_interval),
                                     reply_refresh_days=args.reply_refresh_days)
-            elif args.join_public:
-                print("\nℹ️  参加だけ完了しました。エクスポートも行うには --all-channels を付けて再実行してください。")
             return
 
         # --- 単一チャンネルモード（従来挙動） ---
@@ -955,6 +891,10 @@ def main():
             print("ℹ️  --update は全期間モード（--all / 日付 all）のときだけ有効です。無視します。")
 
         channel = get_channel_info(client, args.channel_id)
+        # 公開チャンネル以外（非公開チャンネル・DM・グループDM）は一切取得しない
+        if channel.get("is_private") or channel.get("is_im") or channel.get("is_mpim"):
+            print(f"🚫 公開チャンネル以外 ({args.channel_id}) は取得対象外です")
+            raise SystemExit(1)
         if args.skip_existing and not incremental and os.path.exists(output_path(channel, period)):
             print(f"⏭️  既に取得済みです: {output_path(channel, period)}")
             return
