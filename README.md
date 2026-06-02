@@ -26,9 +26,9 @@ pip install -r requirements.txt
 
 > User トークンなら、公開チャンネルは **参加していなくても履歴を読めます**（アーカイブ済みを含む）。
 
-### アーカイブ済みチャンネル（`--include-archived`）
+### アーカイブ済みチャンネル（既定で含む）
 
-`--list` / `--all-channels` に `--include-archived` を付けると、アーカイブ済みチャンネルも対象に含めます。
+`--list` / `--all-channels` は **既定でアーカイブ済みチャンネルも対象に含めます**。除外したいときだけ `--exclude-archived` を付けてください。
 
 - 一覧は `conversations.list` でワークスペースの公開チャンネルを参加有無に関わらず列挙します。**アーカイブ済みかつ未参加の公開チャンネル** の履歴も、User トークンならそのまま読めます。
 - **非公開（プライベート）チャンネルは対象外です**（上記のとおり、参加有無に関わらず取得しません）。
@@ -59,11 +59,11 @@ SLACK_TOKEN=xoxp-xxxxxxxxxxxx-xxxxxxxxxxxx
 ### チャンネル一覧
 
 ```bash
-# 参照可能な公開チャンネルを一覧表示し result/channels.json に保存
+# 参照可能な公開チャンネルを一覧表示し result/channels.json に保存（アーカイブ済みも含む）
 python export_slack.py --list
 
-# アーカイブ済みの公開チャンネルも一覧に含める（要 User トークン）
-python export_slack.py --list --include-archived
+# アーカイブ済みを除外して一覧表示
+python export_slack.py --list --exclude-archived
 ```
 
 ### ユーザー一覧
@@ -78,6 +78,7 @@ python export_slack.py --list-users
 ### 全チャンネルを一括エクスポート
 
 `--list` で表示されるチャンネル（= ワークスペースの公開チャンネル）すべてが対象です。
+**アーカイブ済みチャンネルも既定で含まれます。** 除外したいときは `--exclude-archived` を付けます（前述の「アーカイブ済みチャンネル」節を参照）。
 チャンネルは 1 件ずつ直列に取得し、各チャンネル内のスレッド返信（`conversations.replies`）も直列に取得します（後述の理由で、並列にしてもレート枠が律速で速くならないため）。
 
 ```bash
@@ -96,9 +97,9 @@ python export_slack.py --all-channels --start-rate 12
 # 429 リトライ上限（0 = 無制限。各回 Retry-After ぶん待機）
 python export_slack.py --all-channels --max-retries 0
 
-# スレッド返信は取得しない / アーカイブ済み公開チャンネルも含める
+# スレッド返信は取得しない / アーカイブ済みを除外する
 python export_slack.py --all-channels --no-threads
-python export_slack.py --all-channels --include-archived
+python export_slack.py --all-channels --exclude-archived
 ```
 
 #### 増分取得（`--update`）
@@ -177,7 +178,7 @@ python export_slack.py <チャンネルID> all
 
 ## 運用取得をワンコマンドで（`update.sh`）
 
-`users.json` 更新 → 全チャンネル増分取得 → SQLite 反映、をまとめて実行します。ログは `logs/update-YYYYMMDD-HHMMSS.log` に保存されます。
+`users.json` 更新 → 全チャンネル増分取得 → SQLite 反映、をまとめて実行します。ログは `logs/update-YYYYMMDD-HHMMSS.log` に保存されます。アーカイブ済みチャンネルも含めて取得します（既定の挙動）。
 
 ```bash
 # 通常運用（増分取得 = --update）

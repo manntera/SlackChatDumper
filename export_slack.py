@@ -11,7 +11,7 @@
     python export_slack.py --all-channels --skip-existing  # 取得済みは飛ばす（中断後の再開）
     python export_slack.py --all-channels --update         # 既存ファイルがあれば新規ぶんだけ取得してマージ（増分取得）
     python export_slack.py --all-channels --update --reply-refresh-days 14  # 増分時に既存スレッド返信を取り直す窓（日）
-    python export_slack.py --all-channels --include-archived  # アーカイブ済み公開チャンネルも含める（要 User トークン）
+    python export_slack.py --all-channels --exclude-archived  # アーカイブ済みを除外（既定は含める）
     python export_slack.py --all-channels --no-threads     # スレッド返信は取得しない
     python export_slack.py --all-channels --start-rate 12  # 初期送出レート(req/分・メソッド毎)
     python export_slack.py --all-channels --max-rate 120  # 送出レート上限(req/分・メソッド毎)を引き上げて速度を探る
@@ -435,12 +435,12 @@ def merge_messages(old_messages, new_messages):
 # --------------------------------------------------------------------------- #
 # Slack API 呼び出し（SlackResponse はイテレートすると自動でページネーションされる）
 # --------------------------------------------------------------------------- #
-def list_channels(client, include_archived=False):
+def list_channels(client, include_archived=True):
     """ワークスペースの公開チャンネル一覧を返す（参加・未参加を問わない）。
 
     User トークンなら未参加の公開チャンネルも履歴を読めるため、参加有無で絞らず
-    conversations.list で全公開チャンネルを列挙する。include_archived=True の
-    ときはアーカイブ済みも含める。非公開チャンネル・DM は対象外。
+    conversations.list で全公開チャンネルを列挙する。include_archived=True（デフォルト）
+    のときはアーカイブ済みも含める。非公開チャンネル・DM は対象外。
     """
     channels = []
     for page in client.conversations_list(types="public_channel", limit=200,
@@ -820,9 +820,9 @@ def parse_args():
                    help="参照可能な全チャンネルを全期間エクスポートする")
     p.add_argument("--no-threads", dest="no_threads", action="store_true",
                    help="スレッド返信を取得しない")
-    p.add_argument("--include-archived", dest="include_archived", action="store_true",
-                   help=("アーカイブ済みチャンネルも対象に含める（--list / --all-channels）。"
-                         "未参加の公開チャンネルも列挙するため、履歴取得には User トークン(xoxp-)が必要"))
+    p.add_argument("--exclude-archived", dest="exclude_archived", action="store_true",
+                   help=("アーカイブ済みチャンネルを対象から除外する（--list / --all-channels）。"
+                         "デフォルトはアーカイブ済みも含める（履歴取得には User トークン xoxp- が必要）"))
     p.add_argument("--skip-existing", dest="skip_existing", action="store_true",
                    help="出力 JSON が既にあるチャンネルはスキップする（中断後の再実行に便利）")
     p.add_argument("--update", "--incremental", dest="update", action="store_true",
@@ -861,7 +861,7 @@ def main():
             return
 
         if args.list_only or args.all_channels:
-            channels = list_channels(client, include_archived=args.include_archived)
+            channels = list_channels(client, include_archived=not args.exclude_archived)
             dump_channel_list(channels)
 
             if args.all_channels:
