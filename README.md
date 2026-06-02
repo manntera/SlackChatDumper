@@ -221,7 +221,7 @@ python import_to_sqlite.py --db /tmp/slack.db
 
 | テーブル | 主キー | 主な列 |
 | --- | --- | --- |
-| `channels` | `id` | `name`, `is_private`, `is_im`, `is_mpim`, `period`, `exported_at`, `message_count`, `thread_count`, `reply_count`, `raw` |
+| `channels` | `id` | `name`, `is_private`, `is_archived`, `period`, `exported_at`, `message_count`, `thread_count`, `reply_count`, `raw` |
 | `users` | `id` | `name`, `real_name`, `display_name`, `email`, `is_bot`, `deleted`, `raw` |
 | `messages` | `(channel_id, ts)` | `thread_ts`, `parent_ts`, `is_reply`, `user`, `type`, `subtype`, `text`, `reply_count`, `edited_ts`, `client_msg_id`, `raw` |
 | `reactions` | `(channel_id, ts, name, user)` | （絵文字名と押したユーザーを 1 行ずつ展開） |

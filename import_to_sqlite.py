@@ -28,8 +28,6 @@ CREATE TABLE IF NOT EXISTS channels (
     id              TEXT PRIMARY KEY,
     name            TEXT,
     is_private      INTEGER,
-    is_im           INTEGER,
-    is_mpim         INTEGER,
     is_archived     INTEGER,
     period          TEXT,
     exported_at     TEXT,
@@ -140,13 +138,11 @@ def import_channels(conn: sqlite3.Connection, path: str) -> int:
     with open(path, encoding="utf-8") as f:
         rows = json.load(f)
     sql = """
-        INSERT INTO channels (id, name, is_private, is_im, is_mpim, is_archived, raw)
-        VALUES (:id, :name, :is_private, :is_im, :is_mpim, :is_archived, :raw)
+        INSERT INTO channels (id, name, is_private, is_archived, raw)
+        VALUES (:id, :name, :is_private, :is_archived, :raw)
         ON CONFLICT(id) DO UPDATE SET
             name        = excluded.name,
             is_private  = excluded.is_private,
-            is_im       = excluded.is_im,
-            is_mpim     = excluded.is_mpim,
             is_archived = excluded.is_archived,
             raw         = excluded.raw
     """
@@ -155,8 +151,6 @@ def import_channels(conn: sqlite3.Connection, path: str) -> int:
             "id": c.get("id"),
             "name": c.get("name") or c.get("name_normalized"),
             "is_private": _b(c.get("is_private")),
-            "is_im": _b(c.get("is_im")),
-            "is_mpim": _b(c.get("is_mpim")),
             "is_archived": _b(c.get("is_archived")),
             "raw": _dumps(c),
         }
