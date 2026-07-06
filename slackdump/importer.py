@@ -1,36 +1,21 @@
-"""result/cache/ 配下の Slack エクスポート JSON を SQLite(result/slack.db) に取り込むツール。
-
-このスクリプトは script/ 配下に置かれるが、result/ はリポジトリルート基準で解決するため
-CWD に依存しない。例はリポジトリルートから `python script/import_to_sqlite.py ...` で実行する想定。
-
-使い方:
-    python import_to_sqlite.py
-    python import_to_sqlite.py --result-dir result --db result/slack.db
-    python import_to_sqlite.py --cache-dir result/cache  # JSON 置き場を明示指定
-    python import_to_sqlite.py --reset          # 既存テーブルを DROP して作り直し
-    python import_to_sqlite.py result/cache/slack_C0123_foo_all.json  # 個別ファイルだけ取り込み
+"""result/cache/ 配下の Slack エクスポート JSON を SQLite(result/slack.db) に取り込む。
 
 仕様:
     - 既存 JSON ファイルは一切書き換えない。
     - メッセージは (channel_id, ts) を PK に UPSERT。スレッド返信は parent_ts と is_reply=1 を立てて
       同じ messages テーブルに展開する。
     - reactions / files は (channel_id, ts) 単位で全削除→再投入することで「更新後の状態」に揃える。
-    - --update で再ダンプした JSON もそのまま再投入できる。
+    - 増分取得で再ダンプした JSON もそのまま再投入できる。
 """
 
-import argparse
 import glob
 import json
 import os
 import sqlite3
 import sys
-from typing import Any, Iterable
+from collections.abc import Iterable
 
-# このスクリプトは script/ 配下に置かれる。result/ はリポジトリルート（script/ の親）
-# 基準で解決し、実行時の CWD に依存しないようにする。
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_RESULT_DIR = os.path.join(BASE_DIR, "result")
-
+from .config import CACHE_DIR, DB_PATH
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS channels (
@@ -354,7 +339,7 @@ def import_channel_file(conn: sqlite3.Connection, path: str) -> dict[str, int]:
     del data  # ラッパー dict は不要。messages_in 経由でメッセージ本体だけ握る。
     # pop() は O(1) で末尾から取り出すので、元の JSON 順を保つよう先に反転しておく。
     # 反転しないと「同じ ts が top-level と reply の両方に出てくる」希少ケースで
-    # UPSERT の最終勝者が変わり、parent_ts / is_reply の値が元コードと食い違う。
+    # UPSERT の最終勝者が変わり、parent_ts / is_reply の値が食い違う。
     messages_in.reverse()
 
     # Pass 1: affected_ts を集める（ts 文字列だけなので軽い）。reactions / files を消すために必須。
@@ -430,41 +415,24 @@ def import_channel_file(conn: sqlite3.Connection, path: str) -> dict[str, int]:
     return totals
 
 
-def discover_channel_files(result_dir: str) -> list[str]:
-    pattern = os.path.join(result_dir, "slack_*.json")
+def discover_channel_files(cache_dir) -> list[str]:
     # users.json / channels.json は別経路。slack_ プレフィックスで安全に絞り込み済み。
-    return sorted(glob.glob(pattern))
+    return sorted(glob.glob(os.path.join(cache_dir, "slack_*.json")))
 
 
-def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Slack エクスポート JSON を SQLite に取り込む")
-    p.add_argument("paths", nargs="*", help="取り込む slack_*.json のパス（省略時は --cache-dir 配下を自動探索）")
-    p.add_argument("--result-dir", default=DEFAULT_RESULT_DIR, help="成果物(slack.db)の基準ディレクトリ（既定: <repo>/result）")
-    p.add_argument("--cache-dir", default=None, help="JSON(生キャッシュ)が置かれているディレクトリ（既定: <result-dir>/cache）")
-    p.add_argument("--db", default=None, help="出力 SQLite ファイル（既定: <result-dir>/slack.db）")
-    p.add_argument("--reset", action="store_true", help="既存テーブルを DROP してから作り直す")
-    p.add_argument("--skip-channels", action="store_true", help="channels.json の取り込みをスキップ")
-    p.add_argument("--skip-users", action="store_true", help="users.json の取り込みをスキップ")
-    args = p.parse_args(argv)
-
-    db_path = args.db or os.path.join(args.result_dir, "slack.db")
-    cache_dir = args.cache_dir or os.path.join(args.result_dir, "cache")
-
-    if args.paths:
-        files = list(args.paths)
-    else:
-        files = discover_channel_files(cache_dir)
+def run(paths: list[str] | None = None, reset: bool = False, db_path: str | None = None) -> int:
+    """cache 配下（または指定された JSON）を SQLite に取り込む。"""
+    db_path = db_path or str(DB_PATH)
+    files = list(paths) if paths else discover_channel_files(CACHE_DIR)
 
     conn = connect(db_path)
     try:
-        init_schema(conn, reset=args.reset)
+        init_schema(conn, reset=reset)
 
-        if not args.skip_channels:
-            n = import_channels(conn, os.path.join(cache_dir, "channels.json"))
-            print(f"channels.json: {n} 件")
-        if not args.skip_users:
-            n = import_users(conn, os.path.join(cache_dir, "users.json"))
-            print(f"users.json: {n} 件")
+        n = import_channels(conn, os.path.join(CACHE_DIR, "channels.json"))
+        print(f"channels.json: {n} 件")
+        n = import_users(conn, os.path.join(CACHE_DIR, "users.json"))
+        print(f"users.json: {n} 件")
 
         total_msg = total_react = total_file = 0
         for i, path in enumerate(files, 1):
@@ -488,7 +456,3 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         conn.close()
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slackdump"
+version = "2.0.0"
+description = "Slack 公開チャンネルのエクスポート（JSON）と SQLite 取り込み"
+requires-python = ">=3.10"
+dependencies = [
+    "argcomplete>=3.0",
+    "python-dotenv>=1.0",
+    # PacedWebClient が slack_sdk 内部の _perform_urllib_http_request をフックしているため
+    # メジャーバージョンを固定（3.x では安定）
+    "slack_sdk>=3.31,<4",
+]
+
+[project.scripts]
+slackdump = "slackdump.cli:main"
+
+[tool.setuptools]
+packages = ["slackdump"]
