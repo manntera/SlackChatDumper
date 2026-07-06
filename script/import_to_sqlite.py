@@ -1,10 +1,14 @@
-"""result/ 配下の Slack エクスポート JSON を SQLite に取り込むツール。
+"""result/cache/ 配下の Slack エクスポート JSON を SQLite(result/slack.db) に取り込むツール。
+
+このスクリプトは script/ 配下に置かれるが、result/ はリポジトリルート基準で解決するため
+CWD に依存しない。例はリポジトリルートから `python script/import_to_sqlite.py ...` で実行する想定。
 
 使い方:
     python import_to_sqlite.py
     python import_to_sqlite.py --result-dir result --db result/slack.db
+    python import_to_sqlite.py --cache-dir result/cache  # JSON 置き場を明示指定
     python import_to_sqlite.py --reset          # 既存テーブルを DROP して作り直し
-    python import_to_sqlite.py result/slack_C0123_foo_all.json  # 個別ファイルだけ取り込み
+    python import_to_sqlite.py result/cache/slack_C0123_foo_all.json  # 個別ファイルだけ取り込み
 
 仕様:
     - 既存 JSON ファイルは一切書き換えない。
@@ -21,6 +25,11 @@ import os
 import sqlite3
 import sys
 from typing import Any, Iterable
+
+# このスクリプトは script/ 配下に置かれる。result/ はリポジトリルート（script/ の親）
+# 基準で解決し、実行時の CWD に依存しないようにする。
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_RESULT_DIR = os.path.join(BASE_DIR, "result")
 
 
 SCHEMA = """
@@ -429,8 +438,9 @@ def discover_channel_files(result_dir: str) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Slack エクスポート JSON を SQLite に取り込む")
-    p.add_argument("paths", nargs="*", help="取り込む slack_*.json のパス（省略時は --result-dir 配下を自動探索）")
-    p.add_argument("--result-dir", default="result", help="JSON が置かれているディレクトリ（既定: result）")
+    p.add_argument("paths", nargs="*", help="取り込む slack_*.json のパス（省略時は --cache-dir 配下を自動探索）")
+    p.add_argument("--result-dir", default=DEFAULT_RESULT_DIR, help="成果物(slack.db)の基準ディレクトリ（既定: <repo>/result）")
+    p.add_argument("--cache-dir", default=None, help="JSON(生キャッシュ)が置かれているディレクトリ（既定: <result-dir>/cache）")
     p.add_argument("--db", default=None, help="出力 SQLite ファイル（既定: <result-dir>/slack.db）")
     p.add_argument("--reset", action="store_true", help="既存テーブルを DROP してから作り直す")
     p.add_argument("--skip-channels", action="store_true", help="channels.json の取り込みをスキップ")
@@ -438,21 +448,22 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     db_path = args.db or os.path.join(args.result_dir, "slack.db")
+    cache_dir = args.cache_dir or os.path.join(args.result_dir, "cache")
 
     if args.paths:
         files = list(args.paths)
     else:
-        files = discover_channel_files(args.result_dir)
+        files = discover_channel_files(cache_dir)
 
     conn = connect(db_path)
     try:
         init_schema(conn, reset=args.reset)
 
         if not args.skip_channels:
-            n = import_channels(conn, os.path.join(args.result_dir, "channels.json"))
+            n = import_channels(conn, os.path.join(cache_dir, "channels.json"))
             print(f"channels.json: {n} 件")
         if not args.skip_users:
-            n = import_users(conn, os.path.join(args.result_dir, "users.json"))
+            n = import_users(conn, os.path.join(cache_dir, "users.json"))
             print(f"users.json: {n} 件")
 
         total_msg = total_react = total_file = 0

@@ -1,5 +1,9 @@
 """Slack のチャンネル一覧取得と、メッセージ（スレッド返信込み）の JSON エクスポート。
 
+このスクリプトは script/ 配下に置かれるが、result/ や config.json / .env は
+リポジトリルート基準で解決するため CWD に依存しない。例はリポジトリルートから実行する想定
+（`python script/export_slack.py ...`）。以下は `script/` を省略して記載する。
+
 使い方の例:
     python export_slack.py                         # config.json のデフォルト値で単一チャンネルを取得
     python export_slack.py <channel_id> <date>     # 日付(YYYY-MM-DD)指定
@@ -64,9 +68,17 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from slack_sdk.http_retry.builtin_handlers import ConnectionErrorRetryHandler
 
-load_dotenv()
+# このスクリプトは script/ 配下に置かれる。result/ や config.json / .env は
+# リポジトリルート（script/ の親）基準で解決し、実行時の CWD に依存しないようにする。
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-RESULT_DIR = "result"
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+
+RESULT_DIR = os.path.join(BASE_DIR, "result")
+# 生の Slack ダンプ(JSON)は成果物(slack.db)と分けて result/cache/ に置く。
+# cache/ 配下は Slack から取り直せる landing zone、result 直下の slack.db が成果物。
+CACHE_DIR = os.path.join(RESULT_DIR, "cache")
+DEFAULT_CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 DEFAULT_START_RATE_PER_MIN = 30.0   # メソッドあたりの初期送出レート（req/分）
 MIN_RATE_PER_MIN = 1.0              # これ以上は下げない（実際の待機は Retry-After が担保）
 # AIMD の上限。実測ログでは conversations.replies は 60 を超えると 429 を頻発する。上げすぎると
@@ -348,7 +360,7 @@ class _StatusReporter(threading.Thread):
 # --------------------------------------------------------------------------- #
 # セットアップ
 # --------------------------------------------------------------------------- #
-def load_config(path="config.json"):
+def load_config(path=DEFAULT_CONFIG_PATH):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -383,7 +395,7 @@ def output_path(channel, period):
     channel_id = channel["id"]
     name = channel.get("name") or channel_id
     stem = f"slack_{channel_id}" + (f"_{safe_filename(name)}" if name != channel_id else "")
-    return os.path.join(RESULT_DIR, f"{stem}_{period}.json")
+    return os.path.join(CACHE_DIR, f"{stem}_{period}.json")
 
 
 # --------------------------------------------------------------------------- #
@@ -637,7 +649,7 @@ def _export_channel_inner(client, channel, channel_id, name, oldest, latest, per
         "messages": messages,
     }
 
-    os.makedirs(RESULT_DIR, exist_ok=True)
+    os.makedirs(CACHE_DIR, exist_ok=True)
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -772,8 +784,8 @@ def export_all_channels(client, channels, with_threads=True, skip_existing=False
 
 
 def dump_channel_list(channels, excluded=None):
-    os.makedirs(RESULT_DIR, exist_ok=True)
-    path = os.path.join(RESULT_DIR, "channels.json")
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = os.path.join(CACHE_DIR, "channels.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(channels, f, ensure_ascii=False, indent=2)
     print(f"📋 参照可能な公開チャンネル {len(channels)} 件:")
@@ -789,13 +801,13 @@ def dump_channel_list(channels, excluded=None):
 
 
 def dump_user_list(users):
-    """users.list の結果を result/users.json に保存し、サマリを表示する。
+    """users.list の結果を result/cache/users.json に保存し、サマリを表示する。
 
     メッセージ JSON の `user` フィールド（U0123ABC456 形式）をこの users.json で引けば
     誰の発言か特定できる。出力は users.list の生のメンバー配列をそのまま保持する。
     """
-    os.makedirs(RESULT_DIR, exist_ok=True)
-    path = os.path.join(RESULT_DIR, "users.json")
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = os.path.join(CACHE_DIR, "users.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(users, f, ensure_ascii=False, indent=2)
 
@@ -836,9 +848,9 @@ def parse_args():
                    help=f"取得する日付 YYYY-MM-DD または all (デフォルト: {default_date})")
     p.add_argument("--all", action="store_true", help="全期間のメッセージを取得する")
     p.add_argument("--list", dest="list_only", action="store_true",
-                   help="参照可能な公開チャンネル一覧を表示し result/channels.json に保存する")
+                   help="参照可能な公開チャンネル一覧を表示し result/cache/channels.json に保存する")
     p.add_argument("--list-users", dest="list_users", action="store_true",
-                   help="ワークスペースの全ユーザー一覧を result/users.json に保存する（要 users:read）")
+                   help="ワークスペースの全ユーザー一覧を result/cache/users.json に保存する（要 users:read）")
     p.add_argument("--all-channels", dest="all_channels", action="store_true",
                    help="参照可能な全チャンネルを全期間エクスポートする")
     p.add_argument("--no-threads", dest="no_threads", action="store_true",

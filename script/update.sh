@@ -9,7 +9,9 @@
 #   ./update.sh fresh     # 全期間を取り直す（初回 or 定期フル取得）
 set -euo pipefail
 
-cd "$(dirname "$0")"
+# このスクリプトは script/ 配下。リポジトリルート（script/ の親）で実行し、
+# .venv / result / logs / config.json / .env をルート基準で扱う。
+cd "$(dirname "$0")/.."
 
 mode="${1:-update}"
 case "$mode" in
@@ -32,9 +34,9 @@ echo "=== $(date -Iseconds) start (mode=$mode) ==="
 # shellcheck disable=SC1091
 source .venv/bin/activate
 
-python export_slack.py --list-users
-python export_slack.py "${export_args[@]}"
-python import_to_sqlite.py
+python script/export_slack.py --list-users
+python script/export_slack.py "${export_args[@]}"
+python script/import_to_sqlite.py
 
 echo "=== $(date -Iseconds) done ==="
 echo "log: $log_file"
