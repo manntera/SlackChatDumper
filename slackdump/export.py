@@ -253,7 +253,13 @@ def export_channel(client, channel, incremental=False,
 
     new_messages, hist_pages = fetch_history(client, channel_id, oldest,
                                              inclusive=fetch_inclusive)
-    new_count = len(new_messages)
+    if resume_ts is not None:
+        # inclusive=True で境界メッセージ（resume_ts そのもの）が必ず 1 件返るため、
+        # それを除いた「真に新しい」件数だけを新規として数える（新着ゼロなら 0 件）。
+        new_count = sum(1 for m in new_messages
+                        if m.get("ts") and float(m["ts"]) > float(resume_ts))
+    else:
+        new_count = len(new_messages)
     if existing:
         messages = merge_messages(existing, new_messages)
         del existing, new_messages  # merge_messages が中身を pop し尽くした空 list
